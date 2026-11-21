@@ -1325,12 +1325,13 @@ def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     threading.Thread(target=boot_autostart, daemon=True).start()
-    server = ThreadingHTTPServer((args.bind, args.port), Handler)
-    print(f"fnos-lxc listening on {args.bind}:{args.port}, data={DATA_DIR}", flush=True)
+    # 指定 --socket 时只走飞牛统一网关（由网关校验登录），不再开放任何 TCP 端口
     if args.socket:
-        gw = make_unix_server(args.socket)
-        print(f"fnos-lxc gateway socket {args.socket}", flush=True)
-        threading.Thread(target=gw.serve_forever, daemon=True).start()
+        server = make_unix_server(args.socket)
+        print(f"fnos-lxc gateway socket {args.socket}, data={DATA_DIR}", flush=True)
+    else:
+        server = ThreadingHTTPServer((args.bind, args.port), Handler)
+        print(f"fnos-lxc listening on {args.bind}:{args.port}, data={DATA_DIR}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

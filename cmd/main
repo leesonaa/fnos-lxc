@@ -8,7 +8,6 @@ PID_FILE="${DATA_DIR}/server.pid"
 LOG_FILE="${DATA_DIR}/server.log"
 SERVER="${APP_DIR}/server/main.py"
 SOCK="${APP_DIR}/app.sock"
-PORT=9100
 
 mkdir -p "${DATA_DIR}"
 
@@ -22,7 +21,7 @@ start() {
     echo "python3 not found" >> "${TRIM_TEMP_LOGFILE:-/dev/stderr}"
     return 1
   fi
-  nohup python3 "${SERVER}" --port "${PORT}" --bind 127.0.0.1 --socket "${SOCK}" --data-dir "${DATA_DIR}" >> "${LOG_FILE}" 2>&1 &
+  nohup python3 "${SERVER}" --socket "${SOCK}" --data-dir "${DATA_DIR}" >> "${LOG_FILE}" 2>&1 &
   echo $! > "${PID_FILE}"
   sleep 1
   if ! kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
