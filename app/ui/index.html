@@ -208,7 +208,12 @@
     .row.sel select { flex: 1; min-width: 0; }
     details summary { cursor: pointer; color: var(--muted); margin-bottom: 10px; }
     textarea.raw { width: 100%; height: 220px; background: var(--log-bg); color: var(--log-text); border: 1px solid var(--border); border-radius: 8px; padding: 10px; font: 12px ui-monospace, Menlo, Consolas, monospace; }
-    .modal.term { width: min(1000px, 96vw); height: min(640px, 90vh); display: flex; flex-direction: column; padding: 14px; background: #0a0b0d; }
+    .modal.term {
+      width: min(1000px, 96vw); height: min(640px, 90vh); display: flex; flex-direction: column; padding: 14px; background: #0a0b0d;
+      color-scheme: dark; color: #e8eaed;
+      --text: #e8eaed; --muted: #a3a9b4; --border: rgba(255,255,255,.12);
+      --btn: rgba(255,255,255,.09); --btn-hover: rgba(255,255,255,.17); --input-bg: rgba(0,0,0,.25);
+    }
     .term-box { flex: 1; min-height: 0; padding: 0; background: #0a0b0d; border-radius: 6px; overflow: hidden; }
     .term-box .xterm { height: 100%; }
     .term-box .xterm-viewport { background-color: transparent !important; scrollbar-width: thin; scrollbar-color: #3a4150 transparent; }
@@ -218,9 +223,8 @@
     .term-box .xterm { padding: 6px 12px 6px 6px; }
     .stat { white-space: nowrap; font-variant-numeric: tabular-nums; }
     .stat small, td small { display: block; color: var(--muted); font-size: 11px; }
-    .mbar { height: 4px; width: 90px; border-radius: 2px; background: var(--pbar-bg); overflow: hidden; margin-top: 3px; }
-    .mbar > i { display: block; height: 100%; background: var(--blue); }
     td.actions { white-space: nowrap; }
+    th.c, td.c { text-align: center; }
     .switch { position: relative; display: inline-block; width: 36px; height: 20px; margin: 0; vertical-align: middle; cursor: pointer; }
     .switch input { opacity: 0; width: 0; height: 0; min-width: 0; position: absolute; }
     .switch span { position: absolute; inset: 0; border-radius: 10px; background: var(--btn-hover); transition: background .15s; }
@@ -238,10 +242,9 @@
     .ct-addr { min-height: 18px; }
     .ct-foot { display: flex; gap: 6px; flex-wrap: wrap; border-top: 1px solid var(--border); padding-top: 12px; }
     .ct-foot button { padding: 5px 12px; }
-    .view-toggle { margin-left: auto; display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+    .view-toggle { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
     .view-toggle button { border: 0; border-radius: 0; background: transparent; padding: 7px 14px; }
     .view-toggle button.on { background: var(--btn-hover); color: var(--text); font-weight: 600; }
-    .bulk { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
     .menu {
       position: fixed; z-index: 70; min-width: 110px; padding: 4px;
       background: var(--panel-solid); border: 1px solid var(--border); border-radius: 8px;
@@ -337,6 +340,10 @@
           <p class="sub" style="margin:0">原生 LXC</p>
         </div>
         <div class="spacer"></div>
+        <div class="view-toggle" id="view-toggle">
+          <button data-view="table">列表</button>
+          <button data-view="cards">卡片</button>
+        </div>
         <button id="btn-refresh">刷新</button>
         <button class="primary" id="btn-add">添加容器</button>
         <button id="btn-settings">设置</button>
@@ -354,13 +361,13 @@
               <tr>
                 <th style="width:40px"></th>
                 <th>名称</th>
-                <th>状态</th>
-                <th>CPU</th>
-                <th>内存</th>
+                <th class="c">状态</th>
+                <th class="c">CPU</th>
+                <th class="c">内存</th>
                 <th>地址</th>
-                <th>流量</th>
-                <th>自启</th>
-                <th>运行</th>
+                <th class="c">已用流量</th>
+                <th class="c">自启</th>
+                <th class="c">已运行</th>
                 <th>操作</th>
               </tr>
             </thead>
@@ -370,16 +377,6 @@
           </table>
         </div>
         <div class="cards hidden" id="ct-cards"></div>
-        <div class="bulk" id="bulk">
-          <button data-bulk="start">全部启动</button>
-          <button data-bulk="stop">全部停止</button>
-          <button data-bulk="freeze">全部冻结</button>
-          <button data-bulk="unfreeze">全部解冻</button>
-          <div class="view-toggle" id="view-toggle">
-            <button data-view="table">列表</button>
-            <button data-view="cards">卡片</button>
-          </div>
-        </div>
       </div>
 
       <div id="tab-settings" class="hidden">
@@ -677,8 +674,7 @@
     const statMem = (c) => {
       const t = c.stats;
       if (!t || t.mem == null) return "-";
-      const pct = t.mem_max ? Math.min(100, t.mem / t.mem_max * 100) : 0;
-      return `${fmtBytes(t.mem)}<small>/ ${t.mem_max ? fmtBytes(t.mem_max) : "不限"}</small>${t.mem_max ? `<div class="mbar"><i style="width:${pct.toFixed(1)}%"></i></div>` : ""}`;
+      return `${fmtBytes(t.mem)}<small>/ ${t.mem_max ? fmtBytes(t.mem_max) : "不限"}</small>`;
     };
     const statNet = (c) => c.stats && c.stats.rx != null ? `↓ ${fmtBytes(c.stats.rx)}<small>↑ ${fmtBytes(c.stats.tx)}</small>` : "-";
     const statUp = (c) => c.stats ? `${fmtUptime(c.stats.uptime)}<small>PID ${c.stats.pid}</small>` : "-";
@@ -713,13 +709,13 @@
       return `<tr data-name="${n}">
           <td>${distroIcon(c.distro, c.name, c.webui)}</td>
           <td>${title}</td>
-          <td>${stateBadge(c.state)}</td>
-          <td class="stat" data-k="cpu">${statCpu(c)}</td>
-          <td class="stat" data-k="mem">${statMem(c)}</td>
+          <td class="c">${stateBadge(c.state)}</td>
+          <td class="stat c" data-k="cpu">${statCpu(c)}</td>
+          <td class="stat c" data-k="mem">${statMem(c)}</td>
           <td>${addrCell(c)}</td>
-          <td class="stat" data-k="net">${statNet(c)}</td>
-          <td>${sw}</td>
-          <td class="stat" data-k="up">${statUp(c)}</td>
+          <td class="stat c" data-k="net">${statNet(c)}</td>
+          <td class="c">${sw}</td>
+          <td class="stat c" data-k="up">${statUp(c)}</td>
           <td class="actions">${btns()}</td>
         </tr>`;
     }
@@ -736,8 +732,8 @@
           <div class="ct-stats">
             <div><label>CPU</label><div class="stat" data-k="cpu">${statCpu(c)}</div></div>
             <div><label>内存</label><div class="stat" data-k="mem">${statMem(c)}</div></div>
-            <div><label>流量</label><div class="stat" data-k="net">${statNet(c)}</div></div>
-            <div><label>运行</label><div class="stat" data-k="up">${statUp(c)}</div></div>
+            <div><label>已用流量</label><div class="stat" data-k="net">${statNet(c)}</div></div>
+            <div><label>已运行</label><div class="stat" data-k="up">${statUp(c)}</div></div>
           </div>
           <div class="ct-addr">${addrCell(c)}</div>
           <div class="ct-foot">${btns()}</div>
@@ -834,22 +830,6 @@
       if (!r.ok) { cb.checked = !cb.checked; toast(r.error || "保存失败"); return; }
       toast(cb.checked ? "已开启开机自启" : "已关闭开机自启");
       lastSig = "";
-    });
-
-    $("#bulk").addEventListener("click", async (e) => {
-      const b = e.target.closest("button[data-bulk]");
-      if (!b) return;
-      const a = b.dataset.bulk, label = b.textContent;
-      if (a === "stop" && !confirm("确认停止所有运行中的容器？")) return;
-      $$("#bulk button").forEach((x) => (x.disabled = true));
-      toast(label + "…");
-      const r = await api("/api/containers/action", { method: "POST", body: { action: a } });
-      $$("#bulk button").forEach((x) => (x.disabled = false));
-      if (r.error) toast(r.error);
-      else if (!r.total) toast("没有需要操作的容器");
-      else if (r.ok) toast(`${label}：完成（${r.total} 个）`);
-      else toast(`${label}：${r.failed.length} 个失败 — ${r.failed.map((f) => f.name + (f.error ? "（" + f.error + "）" : "")).join("、")}`);
-      loadContainers();
     });
 
     setInterval(() => {

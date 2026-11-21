@@ -445,17 +445,6 @@ def list_containers() -> list:
     return out
 
 
-def bulk_action(action: str) -> dict:
-    need = {"start": "STOPPED", "stop": "RUNNING", "freeze": "RUNNING", "unfreeze": "FROZEN"}
-    if action not in need:
-        return {"ok": False, "error": "unknown action"}
-    names = [c["name"] for c in _lxc_ls_rows() if c["state"] == need[action]]
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        res = list(ex.map(lambda n: (n, container_action(n, action)), names))
-    failed = [{"name": n, "error": r.get("error", "")} for n, r in res if not r["ok"]]
-    return {"ok": not failed, "total": len(names), "failed": failed}
-
-
 def set_autostart(name: str, enabled: bool) -> dict:
     name = clean_name(name)
     p = ct_config_path(name) if name else None
@@ -1143,10 +1132,6 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/container/create":
             self._json(200, create_container(body))
-            return
-
-        if path == "/api/containers/action":
-            self._json(200, bulk_action(body.get("action", "")))
             return
 
         if path == "/api/container/autostart":
