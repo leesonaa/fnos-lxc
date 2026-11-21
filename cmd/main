@@ -1,0 +1,63 @@
+#!/bin/bash
+# fnos-lxc service control
+
+APP_NAME="fnos-lxc"
+APP_DIR="${TRIM_APPDEST:-/var/apps/${APP_NAME}/target}"
+DATA_DIR="${TRIM_PKGVAR:-/vol1/@appdata/${APP_NAME}}"
+PID_FILE="${DATA_DIR}/server.pid"
+LOG_FILE="${DATA_DIR}/server.log"
+SERVER="${APP_DIR}/server/main.py"
+PORT=9100
+
+mkdir -p "${DATA_DIR}"
+
+start() {
+  if [ -f "${PID_FILE}" ] && kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+    echo "${APP_NAME} already running"
+    return 0
+  fi
+  cd "${APP_DIR}/server"
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 not found" >> "${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+    return 1
+  fi
+  nohup python3 "${SERVER}" --port "${PORT}" --data-dir "${DATA_DIR}" >> "${LOG_FILE}" 2>&1 &
+  echo $! > "${PID_FILE}"
+  sleep 1
+  if ! kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+    tail -n 20 "${LOG_FILE}" >> "${TRIM_TEMP_LOGFILE:-/dev/stderr}" 2>/dev/null
+    rm -f "${PID_FILE}"
+    return 1
+  fi
+  echo "started ${APP_NAME} pid=$(cat ${PID_FILE})"
+}
+
+stop() {
+  if [ -f "${PID_FILE}" ]; then
+    PID=$(cat "${PID_FILE}")
+    if kill -0 "${PID}" 2>/dev/null; then
+      kill "${PID}" 2>/dev/null || true
+      sleep 1
+      kill -9 "${PID}" 2>/dev/null || true
+    fi
+    rm -f "${PID_FILE}"
+  fi
+  # fallback
+  pkill -f "python3 .*${APP_NAME}/.*main.py" 2>/dev/null || true
+  echo "stopped ${APP_NAME}"
+}
+
+status() {
+  if [ -f "${PID_FILE}" ] && kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+    exit 0
+  fi
+  exit 3
+}
+
+case "$1" in
+  start) start || exit 1 ;;
+  stop) stop ;;
+  restart) stop; start || exit 1 ;;
+  status) status ;;
+  *) exit 1 ;;
+esac

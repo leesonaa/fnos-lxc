@@ -1,0 +1,16 @@
+#!/bin/bash
+# wizard/uninstall 的 keep_data 开关以 wizard_keep_data 传入（"true"/"false"）
+DATA_DIR="${TRIM_PKGVAR:-/vol1/@appdata/fnos-lxc}"
+
+if [ "${wizard_keep_data:-true}" = "false" ]; then
+  # 仅删除 lxc-ls 能列出的容器（位于已配置的 lxcpath 内）
+  if command -v lxc-ls >/dev/null 2>&1; then
+    for n in $(lxc-ls -1 2>/dev/null); do
+      lxc-stop -n "$n" -k 2>/dev/null || true
+      lxc-destroy -n "$n" -f 2>/dev/null || true
+    done
+  fi
+  rm -rf "${DATA_DIR}" 2>/dev/null || true
+fi
+echo "fnos-lxc uninstall_callback ok"
+exit 0

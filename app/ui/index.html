@@ -1,0 +1,975 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LXC 容器</title>
+  <link rel="stylesheet" href="vendor/xterm.css" />
+  <style>
+    :root {
+      --bg: #0f1115;
+      --panel: #1a1d24;
+      --border: #2a2f3a;
+      --text: #e8eaed;
+      --muted: #9aa0a6;
+      --green: #3dd68c;
+      --red: #f07178;
+      --orange: #ffb454;
+      --blue: #59c2ff;
+      --btn: #2d3340;
+      --btn-hover: #3a4150;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.5;
+      user-select: none;
+      -webkit-user-select: none;
+      caret-color: transparent;
+    }
+    input, textarea, select, .log, code, .ip, .term-box { user-select: text; -webkit-user-select: text; caret-color: auto; }
+    .pbar { height: 8px; background: #20242c; border-radius: 4px; overflow: hidden; margin: 8px 0 6px; }
+    .pbar > i { display: block; height: 100%; width: 0; background: var(--blue); transition: width .4s; }
+    .pbar.indet > i { width: 35% !important; animation: indet 1.2s ease-in-out infinite alternate; }
+    @keyframes indet { from { margin-left: 0; } to { margin-left: 65%; } }
+    a { color: var(--blue); text-decoration: none; }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 20px 16px 40px; }
+    h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+    .sub { color: var(--muted); margin-bottom: 20px; font-size: 13px; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .spacer { flex: 1; }
+    button, .btn {
+      background: var(--btn);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 7px 14px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    button:hover, .btn:hover { background: var(--btn-hover); }
+    button.primary { background: #2563eb; border-color: #2563eb; }
+    button.primary:hover { background: #1d4ed8; }
+    button.danger { background: #7f1d1d; border-color: #991b1b; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    input, select {
+      background: #12151a;
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 13px;
+      min-width: 180px;
+    }
+    label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+    .field { margin-bottom: 14px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.03em; }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .badge.running { background: rgba(61,214,140,.15); color: var(--green); }
+    .badge.stopped { background: rgba(240,113,120,.12); color: var(--red); }
+    .badge.frozen { background: rgba(255,180,84,.15); color: var(--orange); }
+    .badge.unknown { background: rgba(154,160,166,.15); color: var(--muted); }
+    .actions button { padding: 4px 10px; margin-right: 4px; margin-bottom: 2px; }
+    .icon {
+      width: 30px; height: 30px; border-radius: 7px; padding: 5px;
+      background: #e8eaed; display: inline-flex; align-items: center; justify-content: center;
+    }
+    .icon img { width: 100%; height: 100%; display: block; }
+    .distro { color: var(--muted); font-size: 12px; }
+    .ip { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; cursor: pointer; word-break: break-all; }
+    .ip6 { font-size: 11px; max-width: 230px; }
+    .steps { display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; }
+    .step-pill {
+      padding: 6px 12px; border-radius: 999px; border: 1px solid var(--border);
+      color: var(--muted); font-size: 12px;
+    }
+    .step-pill.active { border-color: var(--blue); color: var(--blue); background: rgba(89,194,255,.08); }
+    .step-pill.done { border-color: var(--green); color: var(--green); }
+    .log {
+      background: #0c0e12; border: 1px solid var(--border); border-radius: 8px;
+      padding: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px; color: #a8b0bc; max-height: 200px; overflow: auto; white-space: pre-wrap;
+    }
+    .hidden { display: none !important; }
+    .empty { text-align: center; color: var(--muted); padding: 40px 10px; }
+    .modal-bg {
+      position: fixed; inset: 0; background: rgba(0,0,0,.55);
+      display: flex; align-items: center; justify-content: center; z-index: 50;
+    }
+    .modal {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 12px; padding: 22px; width: min(480px, 92vw);
+    }
+    .modal h2 { margin: 0 0 14px; font-size: 16px; }
+    .toast {
+      position: fixed; right: 16px; bottom: 16px; background: #1e293b;
+      border: 1px solid var(--border); padding: 10px 14px; border-radius: 8px;
+      z-index: 60; max-width: 320px;
+    }
+    .modal.wide { width: min(680px, 94vw); max-height: 90vh; display: flex; flex-direction: column; }
+    .modal.wide .body { overflow: auto; padding-right: 6px; margin-right: -6px; }
+    fieldset { border: 1px solid var(--border); border-radius: 8px; margin: 0 0 14px; padding: 12px 14px 4px; }
+    legend { color: var(--blue); font-size: 12px; padding: 0 6px; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }
+    .grid2 input, .grid2 select, fieldset input[type=text], fieldset select { width: 100%; min-width: 0; }
+    .check { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 10px; color: var(--text); font-size: 13px; cursor: pointer; }
+    .check input { min-width: 0; width: auto; margin-top: 3px; }
+    .check small { display: block; color: var(--muted); font-size: 12px; }
+    .hint { color: var(--muted); font-size: 12px; margin: 0 0 12px; }
+    .warn { background: rgba(255,180,84,.12); border: 1px solid rgba(255,180,84,.35); color: var(--orange); border-radius: 8px; padding: 8px 12px; font-size: 12px; margin-bottom: 12px; }
+    .mount-row { display: grid; grid-template-columns: 1fr 1fr auto auto; gap: 8px; align-items: center; margin-bottom: 8px; }
+    .mount-row input[type=text] { min-width: 0; }
+    .mount-row label { margin: 0; white-space: nowrap; }
+    .row.sel { flex-wrap: nowrap; }
+    .row.sel button { white-space: nowrap; flex: none; }
+    .row.sel select { flex: 1; min-width: 0; }
+    details summary { cursor: pointer; color: var(--muted); margin-bottom: 10px; }
+    textarea.raw { width: 100%; height: 220px; background: #0c0e12; color: #c9d1d9; border: 1px solid var(--border); border-radius: 8px; padding: 10px; font: 12px ui-monospace, Menlo, Consolas, monospace; }
+    .modal.term { width: min(1000px, 96vw); height: min(640px, 90vh); display: flex; flex-direction: column; padding: 14px; background: #0a0b0d; }
+    .term-box { flex: 1; min-height: 0; padding: 6px; background: #0a0b0d; border-radius: 6px; overflow: hidden; }
+    .term-box .xterm { height: 100%; }
+    .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
+    .tab {
+      padding: 8px 14px; cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent;
+    }
+    .tab.active { color: var(--text); border-bottom-color: var(--blue); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <!-- SETUP WIZARD -->
+    <div id="setup-view" class="hidden">
+      <h1>LXC 初始化向导</h1>
+      <p class="sub">使用原生 LXC。按步骤完成后进入管理界面。</p>
+      <div class="steps" id="step-pills">
+        <div class="step-pill" data-s="1">1. 安装软件包</div>
+        <div class="step-pill" data-s="2">2. 存储路径</div>
+        <div class="step-pill" data-s="3">3. 网络桥接</div>
+        <div class="step-pill" data-s="4">4. 完成</div>
+      </div>
+
+      <div class="card" id="step-1">
+        <h3 style="margin-top:0">安装原生 LXC</h3>
+        <p style="color:var(--muted)">将通过 apt 安装 <code>lxc</code>、<code>lxc-templates</code>、<code>lxcfs</code> 等（需 root，可能需几分钟）。</p>
+        <div class="row">
+          <button class="primary" id="btn-install-pkgs">开始安装</button>
+          <span id="pkg-status" class="sub" style="margin:0"></span>
+        </div>
+        <div class="log hidden" id="pkg-log" style="margin-top:12px"></div>
+        <div class="row" style="margin-top:16px">
+          <div class="spacer"></div>
+          <button id="btn-to-2" disabled>下一步</button>
+        </div>
+      </div>
+
+      <div class="card hidden" id="step-2">
+        <h3 style="margin-top:0">选择容器存储路径</h3>
+        <p style="color:var(--muted)">不要放在系统盘。建议数据卷，例如 <code>/vol1/1000/lxc</code>。</p>
+        <div class="field">
+          <label>存储路径 (lxc.lxcpath)</label>
+          <input id="inp-lxcpath" list="vol-list" placeholder="/vol1/1000/lxc" style="width:100%;max-width:420px" />
+          <datalist id="vol-list"></datalist>
+        </div>
+        <div class="row">
+          <button id="btn-back-1">上一步</button>
+          <div class="spacer"></div>
+          <button class="primary" id="btn-to-3">下一步</button>
+        </div>
+      </div>
+
+      <div class="card hidden" id="step-3">
+        <h3 style="margin-top:0">网络桥接</h3>
+        <p style="color:var(--muted)">飞牛请先在「网络设置」开启网卡 OVS。选择 <code>*-ovs</code> 桥，容器将以 veth 挂到该桥。</p>
+        <div class="field">
+          <label>网桥 (lxc.net.0.link)</label>
+          <div class="row sel">
+            <select id="sel-bridge"></select>
+            <button id="btn-refresh-bridge" title="重新检测网桥（刚在飞牛网络设置里新建了 OVS 时点这里）">刷新</button>
+          </div>
+          <div class="hint" id="bridge-hint" style="margin-top:6px"></div>
+        </div>
+        <div class="field">
+          <label>停止超时（秒）</label>
+          <input id="inp-timeout" type="number" value="15" min="5" max="120" style="min-width:100px" />
+        </div>
+        <div class="row">
+          <button id="btn-back-2">上一步</button>
+          <div class="spacer"></div>
+          <button class="primary" id="btn-finalize">完成初始化</button>
+        </div>
+        <div class="log hidden" id="final-log" style="margin-top:12px"></div>
+      </div>
+
+      <div class="card hidden" id="step-4">
+        <h3 style="margin-top:0">初始化完成</h3>
+        <p>LXC 已就绪，可以创建和管理容器了。</p>
+        <button class="primary" id="btn-enter">进入管理界面</button>
+      </div>
+    </div>
+
+    <!-- MAIN MANAGER -->
+    <div id="main-view" class="hidden">
+      <div class="row" style="margin-bottom:8px">
+        <div>
+          <h1>LXC 容器</h1>
+          <p class="sub" style="margin:0">原生 LXC</p>
+        </div>
+        <div class="spacer"></div>
+        <button id="btn-refresh">刷新</button>
+        <button class="primary" id="btn-add">添加容器</button>
+        <button id="btn-settings">设置</button>
+      </div>
+
+      <div class="tabs">
+        <div class="tab active" data-tab="list">容器</div>
+        <div class="tab" data-tab="settings">设置</div>
+      </div>
+
+      <div id="tab-list">
+        <div class="card" style="padding:0;overflow:auto">
+          <table>
+            <thead>
+              <tr>
+                <th style="width:40px"></th>
+                <th>名称</th>
+                <th>状态</th>
+                <th>IPv4</th>
+                <th>IPv6</th>
+                <th>自启</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="ct-body">
+              <tr><td colspan="7" class="empty">加载中…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="tab-settings" class="hidden">
+        <div class="card">
+          <div class="field">
+            <label>存储路径</label>
+            <input id="set-lxcpath" style="width:100%;max-width:420px" />
+          </div>
+          <div class="field">
+            <label>默认网桥（新建容器使用）</label>
+            <div class="row sel" style="max-width:360px">
+              <select id="set-bridge" style="flex:1"></select>
+              <button id="btn-refresh-bridge2">刷新</button>
+            </div>
+          </div>
+          <div class="field">
+            <label>停止超时（秒）</label>
+            <input id="set-timeout" type="number" min="5" max="120" style="min-width:100px" />
+          </div>
+          <button class="primary" id="btn-save-settings">保存</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Add modal -->
+  <div class="modal-bg hidden" id="modal-add">
+    <div class="modal">
+      <h2>添加容器</h2>
+      <div class="field">
+        <label>名称</label>
+        <input id="add-name" placeholder="my-debian" style="width:100%" />
+      </div>
+      <div class="field">
+        <label>镜像源（国内用户建议选高校镜像，下载更快）</label>
+        <select id="add-mirror" style="width:100%"></select>
+      </div>
+      <div class="field">
+        <label>发行版</label>
+        <select id="add-distro" style="width:100%"></select>
+      </div>
+      <div class="field">
+        <label>版本</label>
+        <select id="add-release" style="width:100%"></select>
+      </div>
+      <div class="field">
+        <label><input type="checkbox" id="add-autostart" /> 开机自启</label>
+      </div>
+      <p class="hint">首次创建会从 images.linuxcontainers.org 下载模板，可能较慢。创建完成后会自动打开配置页（可设置 TUN、Docker、静态 IP 等）。</p>
+      <div class="row">
+        <div class="spacer"></div>
+        <button id="add-cancel">取消</button>
+        <button class="primary" id="add-ok">创建</button>
+      </div>
+      <div class="hidden" id="add-prog" style="margin-top:10px">
+        <div id="add-stage">准备中…</div>
+        <div class="pbar indet" id="add-bar"><i></i></div>
+        <div class="hint" id="add-detail" style="margin:0"></div>
+      </div>
+      <div class="log hidden" id="add-log" style="margin-top:10px"></div>
+    </div>
+  </div>
+
+
+  <!-- Config modal -->
+  <div class="modal-bg hidden" id="modal-cfg">
+    <div class="modal wide">
+      <h2 id="cfg-title">配置</h2>
+      <div class="body">
+        <div class="warn hidden" id="cfg-running">容器正在运行：修改保存后需要重启容器才会生效。</div>
+
+        <fieldset>
+          <legend>基本</legend>
+          <div class="grid2">
+            <div class="field"><label>主机名</label><input type="text" id="c-hostname" placeholder="留空则与容器名相同" /></div>
+            <div class="field"><label>自启延迟（秒）</label><input type="number" id="c-delay" min="0" max="600" /></div>
+          </div>
+          <label class="check"><input type="checkbox" id="c-autostart" /><span>开机自动启动</span></label>
+        </fieldset>
+
+        <fieldset>
+          <legend>网络</legend>
+          <div class="grid2">
+            <div class="field">
+              <label>网桥</label>
+              <div class="row sel"><select id="c-bridge"></select><button type="button" id="c-bridge-refresh">刷新</button></div>
+            </div>
+            <div class="field"><label>MAC 地址（留空自动生成）</label><input type="text" id="c-mac" placeholder="00:16:3e:xx:xx:xx" /></div>
+          </div>
+          <div class="grid2">
+            <div class="field">
+              <label>IPv4</label>
+              <select id="c-v4mode"><option value="dhcp">DHCP（自动获取）</option><option value="static">静态</option></select>
+            </div>
+            <div class="field">
+              <label>IPv6</label>
+              <select id="c-v6mode"><option value="auto">自动（SLAAC / DHCPv6）</option><option value="static">静态</option></select>
+            </div>
+          </div>
+          <div class="grid2 v4s hidden">
+            <div class="field"><label>IPv4 地址/掩码</label><input type="text" id="c-v4addr" placeholder="192.168.1.50/24" /></div>
+            <div class="field"><label>IPv4 网关</label><input type="text" id="c-v4gw" placeholder="192.168.1.1" /></div>
+          </div>
+          <div class="grid2 v6s hidden">
+            <div class="field"><label>IPv6 地址/前缀</label><input type="text" id="c-v6addr" placeholder="fd00::50/64" /></div>
+            <div class="field"><label>IPv6 网关</label><input type="text" id="c-v6gw" placeholder="fe80::1 或留空" /></div>
+          </div>
+          <p class="hint">选择静态后，由 LXC 在容器网卡上直接配置地址；容器内如仍在跑 DHCP 客户端可能产生第二个地址，DNS 需在容器内自行设置。</p>
+        </fieldset>
+
+        <fieldset>
+          <legend>资源限制（0 = 不限制）</legend>
+          <div class="grid2">
+            <div class="field"><label>CPU 核数上限（可填小数，如 1.5）</label><input type="number" id="c-cpu" min="0" step="0.5" /></div>
+            <div class="field"><label>内存上限（MB）</label><input type="number" id="c-mem" min="0" step="128" /></div>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>设备与功能</legend>
+          <label class="check"><input type="checkbox" id="c-tun" /><span>TUN/TAP 设备<small>VPN 类应用需要：Tailscale、WireGuard、OpenVPN、sing-box 等</small></span></label>
+          <label class="check"><input type="checkbox" id="c-fuse" /><span>FUSE 设备<small>rclone mount、sshfs、alist 挂载等</small></span></label>
+          <label class="check"><input type="checkbox" id="c-gpu" /><span>核显/GPU 直通（/dev/dri）<small>Jellyfin / Plex 硬件转码</small></span></label>
+          <label class="check"><input type="checkbox" id="c-docker" /><span>支持在容器内运行 Docker / 嵌套容器<small>关闭 AppArmor 限制并放开设备与能力，容器隔离性会降低</small></span></label>
+        </fieldset>
+
+        <fieldset>
+          <legend>目录挂载（宿主机 → 容器）</legend>
+          <div id="c-mounts"></div>
+          <button type="button" id="c-mount-add" style="margin-bottom:12px">+ 添加挂载</button>
+        </fieldset>
+
+        <details>
+          <summary>高级：直接编辑原始配置</summary>
+          <textarea class="raw" id="c-raw" spellcheck="false"></textarea>
+          <div class="row" style="margin:8px 0 14px">
+            <button type="button" id="c-raw-save">保存原始配置</button>
+            <span class="hint" style="margin:0">保存会覆盖表单上方的内容；旧配置备份为 config.fnos-bak</span>
+          </div>
+        </details>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <div class="spacer"></div>
+        <button id="cfg-cancel">关闭</button>
+        <button class="primary" id="cfg-save">保存</button>
+        <button class="primary hidden" id="cfg-save-restart">保存并重启</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Terminal modal -->
+  <div class="modal-bg hidden" id="modal-term">
+    <div class="modal term">
+      <div class="row" style="margin-bottom:8px">
+        <strong id="term-title">终端</strong>
+        <span class="hint" id="term-status" style="margin:0"></span>
+        <div class="spacer"></div>
+        <button id="term-reconnect" class="hidden">重新连接</button>
+        <button id="term-close">关闭</button>
+      </div>
+      <div class="term-box" id="term-box"></div>
+    </div>
+  </div>
+
+  <div class="toast hidden" id="toast"></div>
+
+  <script src="vendor/xterm.js"></script>
+  <script src="vendor/addon-fit.js"></script>
+  <script>
+    const $ = (s) => document.querySelector(s);
+    const $$ = (s) => [...document.querySelectorAll(s)];
+
+    function toast(msg) {
+      const t = $("#toast");
+      t.textContent = msg;
+      t.classList.remove("hidden");
+      setTimeout(() => t.classList.add("hidden"), 2800);
+    }
+
+    async function api(path, opts = {}) {
+      const r = await fetch(path, {
+        headers: { "Content-Type": "application/json" },
+        ...opts,
+        body: opts.body ? JSON.stringify(opts.body) : undefined,
+      });
+      return r.json();
+    }
+
+    let setupStep = 1;
+    let setupInfo = null;
+    let currentConfig = {};
+
+    function showSetup(step) {
+      setupStep = step;
+      $("#setup-view").classList.remove("hidden");
+      $("#main-view").classList.add("hidden");
+      [1, 2, 3, 4].forEach((n) => {
+        const el = $(`#step-${n}`);
+        if (el) el.classList.toggle("hidden", n !== step);
+      });
+      $$("#step-pills .step-pill").forEach((p) => {
+        const s = +p.dataset.s;
+        p.classList.toggle("active", s === step);
+        p.classList.toggle("done", s < step);
+      });
+    }
+
+    function showMain() {
+      $("#setup-view").classList.add("hidden");
+      $("#main-view").classList.remove("hidden");
+      loadContainers();
+      loadSettingsForm();
+    }
+
+    function stateBadge(state) {
+      const s = (state || "").toUpperCase();
+      let cls = "unknown";
+      if (s === "RUNNING") cls = "running";
+      else if (s === "STOPPED") cls = "stopped";
+      else if (s === "FROZEN") cls = "frozen";
+      return `<span class="badge ${cls}">${s || "?"}</span>`;
+    }
+
+    const esc = (x) => String(x ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+    const ICONS = { debian: "debian", ubuntu: "ubuntu", alpine: "alpinelinux", fedora: "fedora", centos: "centos",
+      archlinux: "archlinux", arch: "archlinux", opensuse: "opensuse", "opensuse-leap": "opensuse", rockylinux: "rockylinux", rocky: "rockylinux",
+      almalinux: "almalinux", kali: "kalilinux", mint: "linuxmint", linuxmint: "linuxmint", gentoo: "gentoo", voidlinux: "voidlinux",
+      void: "voidlinux", nixos: "nixos", rhel: "redhat", openwrt: "openwrt" };
+    function distroIcon(d) {
+      const slug = ICONS[(d || "").toLowerCase()] || "linux";
+      return `<span class="icon"><img src="icons/${slug}.svg" alt="${esc(d)}" title="${esc(d)}" onerror="this.onerror=null;this.src='icons/linux.svg'"></span>`;
+    }
+
+    function ipCell(list, cls) {
+      if (!list || !list.length) return "-";
+      return list.map((ip) => `<div class="ip ${cls || ""}" data-copy="${esc(ip)}" title="点击复制">${esc(ip)}</div>`).join("");
+    }
+
+    // 非 HTTPS 页面没有 navigator.clipboard，退回 execCommand
+    async function copyText(s) {
+      try { await navigator.clipboard.writeText(s); return true; } catch (e) {}
+      const ta = document.createElement("textarea");
+      ta.value = s; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select();
+      let ok = false;
+      try { ok = document.execCommand("copy"); } catch (e) {}
+      ta.remove();
+      return ok;
+    }
+
+    let containers = [], lastSig = "";
+    async function loadContainers() {
+      const data = await api("/api/containers");
+      const tb = $("#ct-body");
+      const sig = JSON.stringify(data.containers || []);
+      if (sig === lastSig) return;
+      lastSig = sig;
+      containers = data.containers || [];
+      if (!containers.length) {
+        tb.innerHTML = `<tr><td colspan="7" class="empty">暂无容器。点击右上角「添加容器」开始。</td></tr>`;
+        return;
+      }
+      tb.innerHTML = containers.map((c) => {
+        const st = (c.state || "").toUpperCase();
+        const running = st === "RUNNING";
+        const frozen = st === "FROZEN";
+        const n = esc(c.name);
+        return `<tr>
+          <td>${distroIcon(c.distro)}</td>
+          <td><strong>${n}</strong><div class="distro">${esc(c.distro)}${c.release ? " " + esc(c.release) : ""}</div></td>
+          <td>${stateBadge(c.state)}</td>
+          <td>${ipCell(c.ipv4)}</td>
+          <td>${ipCell(c.ipv6, "ip6")}</td>
+          <td>${c.autostart ? "yes" : "no"}</td>
+          <td class="actions">
+            ${running ? `<button data-a="term" data-n="${n}" class="primary">终端</button>` : ""}
+            <button data-a="cfg" data-n="${n}">配置</button>
+            ${running
+              ? `<button data-a="stop" data-n="${n}">停止</button>
+                 <button data-a="kill" data-n="${n}">强杀</button>
+                 <button data-a="freeze" data-n="${n}">冻结</button>`
+              : frozen
+              ? `<button data-a="unfreeze" data-n="${n}">解冻</button>`
+              : `<button data-a="start" data-n="${n}">启动</button>`
+            }
+            <button data-a="destroy" data-n="${n}" class="danger">删除</button>
+          </td>
+        </tr>`;
+      }).join("");
+      tb.querySelectorAll("button[data-a]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const a = btn.dataset.a, n = btn.dataset.n;
+          if (a === "cfg") openConfig(n);
+          else if (a === "term") openTerm(n);
+          else onAction(n, a);
+        });
+      });
+      tb.querySelectorAll("[data-copy]").forEach((el) => {
+        el.addEventListener("click", () => {
+          copyText(el.dataset.copy).then((ok) => toast(ok ? "已复制 " + el.dataset.copy : "复制失败，请手动选中复制"));
+        });
+      });
+    }
+
+    setInterval(() => {
+      if (document.hidden || $("#main-view").classList.contains("hidden")) return;
+      if (!$("#tab-list").classList.contains("hidden")) loadContainers();
+    }, 4000);
+
+    async function onAction(name, action) {
+      if (action === "destroy" && !confirm(`确认删除容器 ${name}？不可恢复。`)) return;
+      toast(`${action} ${name}…`);
+      const r = await api("/api/container/action", { method: "POST", body: { name, action } });
+      if (!r.ok) toast(r.error || r.detail?.stderr || "失败");
+      else toast("完成");
+      loadContainers();
+    }
+
+    async function loadSettingsForm() {
+      const st = await api("/api/status");
+      currentConfig = st.config || {};
+      $("#set-lxcpath").value = currentConfig.lxcpath || "";
+      fillBridges($("#set-bridge"), (await api("/api/bridges")).bridges, currentConfig.bridge || "");
+      $("#set-timeout").value = currentConfig.timeout || 15;
+    }
+
+    // ----- bridges -----
+    function fillBridges(sel, bridges, keep) {
+      const cur = keep ?? sel.value;
+      const list = [...(bridges || [])];
+      if (cur && !list.includes(cur)) list.unshift(cur);
+      sel.innerHTML = list.map((b) => `<option value="${esc(b)}">${esc(b)}</option>`).join("");
+      if (cur) sel.value = cur;
+      return list;
+    }
+    async function refreshBridges(sel, hintEl, btn) {
+      if (btn) { btn.disabled = true; btn.textContent = "检测中…"; }
+      try {
+        const r = await api("/api/bridges");
+        fillBridges(sel, r.bridges);
+        if (hintEl) hintEl.textContent = r.bridges.length ? `检测到 ${r.bridges.length} 个网桥` : "未检测到网桥：请先在飞牛「网络设置」里为网卡开启 OVS，然后点刷新";
+        toast(r.bridges.length ? "网桥列表已刷新" : "未检测到网桥");
+        return r.bridges;
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = "刷新"; }
+      }
+    }
+    $("#btn-refresh-bridge").onclick = () => refreshBridges($("#sel-bridge"), $("#bridge-hint"), $("#btn-refresh-bridge"));
+    $("#btn-refresh-bridge2").onclick = () => refreshBridges($("#set-bridge"), null, $("#btn-refresh-bridge2"));
+
+    // ----- setup handlers -----
+    $("#btn-install-pkgs").onclick = async () => {
+      const btn = $("#btn-install-pkgs");
+      btn.disabled = true;
+      $("#pkg-status").textContent = "安装中，请稍候…";
+      $("#pkg-log").classList.remove("hidden");
+      $("#pkg-log").textContent = "apt-get update && install lxc…\n";
+      const r = await api("/api/setup/install-packages", { method: "POST", body: {} });
+      $("#pkg-log").textContent += JSON.stringify(r, null, 2);
+      if (r.ok || r.has_lxc) {
+        $("#pkg-status").textContent = "安装成功";
+        $("#btn-to-2").disabled = false;
+        toast("软件包已就绪");
+      } else {
+        $("#pkg-status").textContent = "安装失败，请查看日志（或 SSH 手动 apt install lxc）";
+        // allow skip if already present
+        const info = await api("/api/setup/info");
+        if (info.has_lxc) $("#btn-to-2").disabled = false;
+      }
+      btn.disabled = false;
+    };
+
+    $("#btn-to-2").onclick = async () => {
+      setupInfo = await api("/api/setup/info");
+      const dl = $("#vol-list");
+      dl.innerHTML = (setupInfo.volumes || []).map((v) => `<option value="${v}/lxc">`).join("");
+      if (!$("#inp-lxcpath").value) {
+        const prefer = (setupInfo.volumes || []).find((v) => v.includes("/1000")) || (setupInfo.volumes || [])[0];
+        $("#inp-lxcpath").value = prefer ? `${prefer}/lxc` : "/vol1/lxc";
+      }
+      showSetup(2);
+    };
+    $("#btn-back-1").onclick = () => showSetup(1);
+    $("#btn-to-3").onclick = () => {
+      if (!$("#inp-lxcpath").value.trim()) { toast("请填写路径"); return; }
+      const sel = $("#sel-bridge");
+      fillBridges(sel, setupInfo.bridges);
+      $("#bridge-hint").textContent = (setupInfo.bridges || []).length ? `检测到 ${setupInfo.bridges.length} 个网桥` : "未检测到网桥：请先在飞牛「网络设置」里为网卡开启 OVS，然后点刷新";
+      showSetup(3);
+    };
+    $("#btn-back-2").onclick = () => showSetup(2);
+
+    $("#btn-finalize").onclick = async () => {
+      const btn = $("#btn-finalize");
+      btn.disabled = true;
+      $("#final-log").classList.remove("hidden");
+      $("#final-log").textContent = "写入配置…\n";
+      const r = await api("/api/setup/finalize", {
+        method: "POST",
+        body: {
+          lxcpath: $("#inp-lxcpath").value.trim(),
+          bridge: $("#sel-bridge").value,
+          timeout: +$("#inp-timeout").value || 15,
+        },
+      });
+      $("#final-log").textContent += JSON.stringify(r, null, 2);
+      if (r.ok) {
+        showSetup(4);
+        toast("初始化完成");
+      } else {
+        toast("失败：" + (r.error || "unknown"));
+      }
+      btn.disabled = false;
+    };
+
+    $("#btn-enter").onclick = () => showMain();
+
+    // ----- main -----
+    $("#btn-refresh").onclick = () => loadContainers();
+    const DISTRO_NAMES = {
+      alpine: "Alpine", debian: "Debian", ubuntu: "Ubuntu", fedora: "Fedora", archlinux: "Arch Linux",
+      rockylinux: "Rocky Linux", almalinux: "AlmaLinux", centos: "CentOS", opensuse: "openSUSE", kali: "Kali Linux",
+      mint: "Linux Mint", voidlinux: "Void Linux", nixos: "NixOS", openwrt: "OpenWrt", gentoo: "Gentoo",
+      devuan: "Devuan", oracle: "Oracle Linux", amazonlinux: "Amazon Linux", busybox: "BusyBox", cachyos: "CachyOS",
+      alt: "ALT Linux", slackware: "Slackware", openeuler: "openEuler", plamo: "Plamo Linux",
+    };
+    let tplList = [];
+    function fillReleases() {
+      const d = $("#add-distro").value;
+      $("#add-release").innerHTML = tplList.filter((x) => x.distro === d)
+        .map((x) => `<option value="${esc(x.release)}">${esc(x.label || x.release)}</option>`).join("");
+    }
+    $("#add-distro").onchange = fillReleases;
+    function fmtMB(n) { return (n / 1048576).toFixed(1) + " MB"; }
+    let addJob = null;
+    function addBusy(b) {
+      $("#add-ok").disabled = b;
+      $("#add-name").disabled = $("#add-mirror").disabled = $("#add-distro").disabled = $("#add-release").disabled = b;
+    }
+    async function pollJob(id) {
+      const bar = $("#add-bar");
+      for (;;) {
+        const j = await api(`/api/job/${id}`);
+        if (!j.ok) { addBusy(false); toast(j.error || "任务丢失"); addJob = null; return; }
+        const known = j.progress > 1;
+        bar.classList.toggle("indet", j.status === "running" && j.stage === "下载根文件系统" && !j.total);
+        bar.firstElementChild.style.width = j.progress + "%";
+        $("#add-stage").textContent = `${j.stage}（${j.progress}%）`;
+        $("#add-detail").textContent = (j.total ? `${fmtMB(j.downloaded)} / ${fmtMB(j.total)} · ` : "") + `已用时 ${j.elapsed}s`;
+        $("#add-log").textContent = (j.log || []).join("\n");
+        if (j.status === "done") {
+          addJob = null; addBusy(false);
+          toast("创建成功");
+          $("#modal-add").classList.add("hidden");
+          await loadContainers();
+          openConfig(j.name);
+          return;
+        }
+        if (j.status === "error") {
+          addJob = null; addBusy(false);
+          $("#add-log").classList.remove("hidden");
+          $("#add-stage").textContent = "创建失败";
+          toast(j.error || "创建失败");
+          return;
+        }
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+    async function loadTemplates(mirror) {
+      $("#add-distro").innerHTML = `<option>加载中…</option>`;
+      $("#add-release").innerHTML = "";
+      $("#add-ok").disabled = true;
+      const t = await api("/api/templates" + (mirror ? `?mirror=${encodeURIComponent(mirror)}` : ""));
+      $("#add-ok").disabled = !!addJob;
+      if (!mirror || !$("#add-mirror").options.length) {
+        $("#add-mirror").innerHTML = (t.mirrors || []).map((m) => `<option value="${esc(m.id)}">${esc(m.name)}</option>`).join("");
+        $("#add-mirror").value = t.mirror;
+      }
+      tplList = t.templates || [];
+      const distros = [...new Set(tplList.map((x) => x.distro))];
+      $("#add-distro").innerHTML = distros.map((d) => `<option value="${esc(d)}">${esc(DISTRO_NAMES[d] || d)}</option>`).join("");
+      $("#add-distro").value = distros.includes("debian") ? "debian" : distros[0];
+      fillReleases();
+      if (t.online === false) toast("无法连接该镜像源，仅显示常用模板（可换一个镜像源）");
+    }
+    $("#add-mirror").onchange = () => loadTemplates($("#add-mirror").value);
+    $("#btn-add").onclick = async () => {
+      $("#modal-add").classList.remove("hidden");
+      if (addJob) return;
+      $("#add-prog").classList.add("hidden");
+      $("#add-log").classList.add("hidden");
+      $("#add-name").value = "";
+      $("#add-mirror").innerHTML = "";
+      await loadTemplates("");
+    };
+    $("#add-cancel").onclick = () => $("#modal-add").classList.add("hidden");
+    $("#add-ok").onclick = async () => {
+      const name = $("#add-name").value.trim();
+      if (!name) { toast("请输入名称"); return; }
+      const distro = $("#add-distro").value, release = $("#add-release").value;
+      if (!release) { toast("请选择版本"); return; }
+      addBusy(true);
+      $("#add-prog").classList.remove("hidden");
+      $("#add-log").classList.add("hidden");
+      $("#add-stage").textContent = "开始创建…";
+      $("#add-detail").textContent = "";
+      $("#add-bar").classList.add("indet");
+      const r = await api("/api/container/create", {
+        method: "POST",
+        body: { name, distro, release, mirror: $("#add-mirror").value, autostart: $("#add-autostart").checked },
+      });
+      if (!r.ok) { addBusy(false); toast(r.error || "创建失败"); $("#add-prog").classList.add("hidden"); return; }
+      addJob = r.job;
+      pollJob(r.job);
+    };
+
+    $$(".tab").forEach((tab) => {
+      tab.onclick = () => {
+        $$(".tab").forEach((t) => t.classList.remove("active"));
+        tab.classList.add("active");
+        const name = tab.dataset.tab;
+        $("#tab-list").classList.toggle("hidden", name !== "list");
+        $("#tab-settings").classList.toggle("hidden", name !== "settings");
+      };
+    });
+    $("#btn-settings").onclick = () => {
+      $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === "settings"));
+      $("#tab-list").classList.add("hidden");
+      $("#tab-settings").classList.remove("hidden");
+    };
+    $("#btn-save-settings").onclick = async () => {
+      const r = await api("/api/config/save", {
+        method: "POST",
+        body: {
+          lxcpath: $("#set-lxcpath").value.trim(),
+          bridge: $("#set-bridge").value,
+          timeout: +$("#set-timeout").value || 15,
+        },
+      });
+      toast(r.ok ? "已保存" : (r.error || "保存失败"));
+    };
+
+    // ----- container config form -----
+    let cfgName = "", cfgState = "";
+    const cv = (id) => $("#" + id);
+    function mountRow(m = { host: "", container: "", readonly: false }) {
+      const d = document.createElement("div");
+      d.className = "mount-row";
+      d.innerHTML = `<input type="text" class="m-host" placeholder="宿主机路径 /vol1/1000/media" value="${esc(m.host)}">
+        <input type="text" class="m-ct" placeholder="容器内路径 /media" value="${esc(m.container)}">
+        <label class="check" style="margin:0"><input type="checkbox" class="m-ro" ${m.readonly ? "checked" : ""}>只读</label>
+        <button type="button" class="danger">删除</button>`;
+      d.querySelector("button").onclick = () => d.remove();
+      cv("c-mounts").appendChild(d);
+    }
+    cv("c-mount-add").onclick = () => mountRow();
+    function syncIpRows() {
+      $$(".v4s").forEach((e) => e.classList.toggle("hidden", cv("c-v4mode").value !== "static"));
+      $$(".v6s").forEach((e) => e.classList.toggle("hidden", cv("c-v6mode").value !== "static"));
+    }
+    cv("c-v4mode").onchange = cv("c-v6mode").onchange = syncIpRows;
+    cv("c-bridge-refresh").onclick = () => refreshBridges(cv("c-bridge"), null, cv("c-bridge-refresh"));
+
+    async function openConfig(name) {
+      cfgName = name;
+      const r = await api(`/api/container/${encodeURIComponent(name)}/settings`);
+      if (!r.ok) { toast(r.error || "读取配置失败"); return; }
+      const s = r.settings;
+      cfgState = r.state;
+      cv("cfg-title").textContent = `配置 · ${name}`;
+      const running = cfgState === "RUNNING" || cfgState === "FROZEN";
+      cv("cfg-running").classList.toggle("hidden", !running);
+      cv("cfg-save-restart").classList.toggle("hidden", !running);
+      cv("c-hostname").value = s.hostname || "";
+      cv("c-delay").value = s.start_delay ?? 5;
+      cv("c-autostart").checked = !!s.autostart;
+      fillBridges(cv("c-bridge"), r.bridges, s.bridge || "");
+      cv("c-mac").value = s.hwaddr || "";
+      cv("c-v4mode").value = s.ipv4_mode; cv("c-v4addr").value = s.ipv4_address; cv("c-v4gw").value = s.ipv4_gateway;
+      cv("c-v6mode").value = s.ipv6_mode; cv("c-v6addr").value = s.ipv6_address; cv("c-v6gw").value = s.ipv6_gateway;
+      syncIpRows();
+      cv("c-cpu").value = s.cpu_cores || 0;
+      cv("c-mem").value = s.memory_mb || 0;
+      ["tun", "fuse", "gpu", "docker"].forEach((k) => (cv("c-" + k).checked = !!s[k]));
+      cv("c-mounts").innerHTML = "";
+      (s.mounts || []).forEach(mountRow);
+      const raw = await api(`/api/container/${encodeURIComponent(name)}/config`);
+      cv("c-raw").value = raw.config || "";
+      $("#modal-cfg details").open = false;
+      cv("modal-cfg").classList.remove("hidden");
+    }
+    function collectForm() {
+      return {
+        hostname: cv("c-hostname").value.trim(),
+        start_delay: +cv("c-delay").value || 0,
+        autostart: cv("c-autostart").checked,
+        bridge: cv("c-bridge").value,
+        hwaddr: cv("c-mac").value.trim(),
+        ipv4_mode: cv("c-v4mode").value, ipv4_address: cv("c-v4addr").value.trim(), ipv4_gateway: cv("c-v4gw").value.trim(),
+        ipv6_mode: cv("c-v6mode").value, ipv6_address: cv("c-v6addr").value.trim(), ipv6_gateway: cv("c-v6gw").value.trim(),
+        cpu_cores: +cv("c-cpu").value || 0,
+        memory_mb: +cv("c-mem").value || 0,
+        tun: cv("c-tun").checked, fuse: cv("c-fuse").checked, gpu: cv("c-gpu").checked, docker: cv("c-docker").checked,
+        mounts: $$("#c-mounts .mount-row").map((r) => ({
+          host: r.querySelector(".m-host").value.trim(),
+          container: r.querySelector(".m-ct").value.trim(),
+          readonly: r.querySelector(".m-ro").checked,
+        })),
+      };
+    }
+    async function saveConfig(restart) {
+      const r = await api(`/api/container/${encodeURIComponent(cfgName)}/settings`, { method: "POST", body: collectForm() });
+      if (!r.ok) { toast(r.error || "保存失败"); return; }
+      if (restart) {
+        toast("已保存，正在重启…");
+        await api("/api/container/action", { method: "POST", body: { name: cfgName, action: "stop" } });
+        const st = await api("/api/container/action", { method: "POST", body: { name: cfgName, action: "start" } });
+        if (!st.ok) toast("重启失败：" + (st.error || ""));
+      } else {
+        toast(r.needs_restart ? "已保存，重启容器后生效" : "已保存");
+      }
+      cv("modal-cfg").classList.add("hidden");
+      loadContainers();
+    }
+    cv("cfg-save").onclick = () => saveConfig(false);
+    cv("cfg-save-restart").onclick = () => saveConfig(true);
+    cv("cfg-cancel").onclick = () => cv("modal-cfg").classList.add("hidden");
+    cv("c-raw-save").onclick = async () => {
+      if (!confirm("直接覆盖容器配置文件？（旧配置会备份为 config.fnos-bak）")) return;
+      const r = await api(`/api/container/${encodeURIComponent(cfgName)}/config`, { method: "POST", body: { config: cv("c-raw").value } });
+      toast(r.ok ? (r.needs_restart ? "已保存，重启容器后生效" : "已保存") : (r.error || "保存失败"));
+      if (r.ok) openConfig(cfgName);
+    };
+
+    // ----- web terminal (xterm.js + WebSocket PTY) -----
+    let term = null, fit = null, ws = null, termName = "", ro = null;
+    function termSendResize() {
+      if (ws && ws.readyState === 1 && term) ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
+    }
+    function termConnect() {
+      if (ws) { try { ws.close(); } catch (e) {} }
+      cv("term-reconnect").classList.add("hidden");
+      cv("term-status").textContent = "连接中…";
+      fit.fit();
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      ws = new WebSocket(`${proto}://${location.host}/api/container/${encodeURIComponent(termName)}/term?cols=${term.cols}&rows=${term.rows}`);
+      ws.binaryType = "arraybuffer";
+      const mine = ws;
+      ws.onopen = () => { cv("term-status").textContent = ""; term.focus(); };
+      ws.onmessage = (e) => { if (e.data instanceof ArrayBuffer) term.write(new Uint8Array(e.data)); };
+      ws.onclose = () => {
+        if (mine !== ws) return;
+        term.write("\r\n\x1b[90m[连接已关闭]\x1b[0m\r\n");
+        cv("term-status").textContent = "已断开";
+        cv("term-reconnect").classList.remove("hidden");
+      };
+    }
+    function openTerm(name) {
+      termName = name;
+      cv("term-title").textContent = `终端 · ${name}`;
+      cv("modal-term").classList.remove("hidden");
+      if (term) { term.dispose(); }
+      cv("term-box").textContent = "";
+      term = new Terminal({
+        cursorBlink: true, fontSize: 14, scrollback: 5000, allowProposedApi: true,
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace',
+        theme: { background: "#0a0b0d", foreground: "#d4d8de", cursor: "#3dd68c" },
+      });
+      fit = new FitAddon.FitAddon();
+      term.loadAddon(fit);
+      term.open(cv("term-box"));
+      term.onData((d) => { if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode(d)); });
+      term.onResize(termSendResize);
+      if (ro) ro.disconnect();
+      ro = new ResizeObserver(() => { try { fit.fit(); } catch (e) {} });
+      ro.observe(cv("term-box"));
+      termConnect();
+    }
+    cv("term-reconnect").onclick = termConnect;
+    cv("term-close").onclick = () => {
+      cv("modal-term").classList.add("hidden");
+      if (ws) { const w = ws; ws = null; try { w.close(); } catch (e) {} }
+      if (ro) { ro.disconnect(); ro = null; }
+      if (term) { term.dispose(); term = null; }
+    };
+
+    // boot
+    (async () => {
+      try {
+        const st = await api("/api/status");
+        if (st.initialized && st.has_lxc) {
+          showMain();
+        } else {
+          const info = await api("/api/setup/info");
+          setupInfo = info;
+          if (info.has_lxc) {
+            $("#pkg-status").textContent = "系统已检测到 lxc，可跳过安装";
+            $("#btn-to-2").disabled = false;
+          }
+          showSetup(1);
+        }
+      } catch (e) {
+        showSetup(1);
+        toast("无法连接后端，请确认应用已启动");
+      }
+    })();
+  </script>
+</body>
+</html>

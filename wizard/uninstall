@@ -1,0 +1,14 @@
+[
+  {
+    "stepTitle": "卸载选项",
+    "items": [
+      {
+        "type": "switch",
+        "field": "keep_data",
+        "label": "保留容器数据",
+        "initValue": "true",
+        "helpText": "开启：仅卸载管理程序，保留已创建的 LXC 容器和配置。关闭：同时强制停止并删除所有容器（不可恢复）。"
+      }
+    ]
+  }
+]

@@ -1,0 +1,17 @@
+appname=fnos-lxc
+version=1.0.0
+display_name=LXC 容器
+desc=原生 LXC 容器管理，。安装后引导完成初始化，即可在管理界面创建、启停、快照、终端访问容器。支持 x86 / ARM 全架构。
+source=thirdparty
+platform=all
+maintainer=Claude
+maintainer_url=https://github.com/leesonaa/fnos-lxc
+distributor=leeson
+distributor_url=https://github.com/leesonaa
+os_min_version=1.0.0
+desktop_uidir=ui
+desktop_applaunchname=fnos-lxc.Application
+ctl_stop=true
+checkport=false
+service_port=9100
+changelog=首个版本：原生 LXC + 分步初始化向导 + 容器管理界面

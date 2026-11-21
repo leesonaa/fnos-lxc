@@ -1,0 +1,11 @@
+#!/bin/bash
+# Post-install
+set -e
+DATA_DIR="${TRIM_PKGVAR:-/vol1/@appdata/fnos-lxc}"
+mkdir -p "${DATA_DIR}"
+# mark not initialized
+if [ ! -f "${DATA_DIR}/config.json" ]; then
+  echo '{"initialized": false}' > "${DATA_DIR}/config.json"
+fi
+echo "fnos-lxc install_callback ok"
+exit 0

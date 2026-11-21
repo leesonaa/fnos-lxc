@@ -1,0 +1,4 @@
+#!/bin/bash
+set -e
+echo "fnos-lxc upgrade_callback ok"
+exit 0

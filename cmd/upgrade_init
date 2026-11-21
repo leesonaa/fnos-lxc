@@ -1,0 +1,4 @@
+#!/bin/bash
+set -e
+echo "fnos-lxc upgrade_init ok"
+exit 0
