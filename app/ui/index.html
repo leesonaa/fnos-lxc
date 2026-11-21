@@ -93,7 +93,7 @@
     .pbar.indet > i { width: 35% !important; animation: indet 1.2s ease-in-out infinite alternate; }
     @keyframes indet { from { margin-left: 0; } to { margin-left: 65%; } }
     a { color: var(--blue); text-decoration: none; }
-    .wrap { max-width: 1100px; margin: 0 auto; padding: 20px 16px 40px; }
+    .wrap { max-width: 1480px; margin: 0 auto; padding: 20px 16px 40px; }
     h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
     .sub { color: var(--muted); margin-bottom: 20px; font-size: 13px; }
     .card {
@@ -133,7 +133,7 @@
     label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
     .field { margin-bottom: 14px; }
     table { width: 100%; border-collapse: collapse; }
-    th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    th, td { text-align: left; padding: 14px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
     th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.03em; }
     .badge {
       display: inline-block;
@@ -156,7 +156,8 @@
     .icon img { width: 100%; height: 100%; display: block; }
     .distro { color: var(--muted); font-size: 12px; white-space: nowrap; }
     .ip { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; cursor: pointer; word-break: break-all; }
-    .ip6 { font-size: 11px; max-width: 230px; }
+    .ip6 { font-size: 11px; max-width: 300px; }
+    .ct-addr .ip6 { max-width: none; }
     .steps { display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; }
     .step-pill {
       padding: 6px 12px; border-radius: 999px; border: 1px solid var(--border);
@@ -227,7 +228,20 @@
     .switch input:checked + span { background: #2563eb; }
     .switch input:checked + span::after { transform: translateX(16px); }
     .switch input:disabled + span { opacity: .5; }
-    .bulk { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 16px; }
+    .ct-card { background: var(--panel); -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; box-shadow: 0 8px 28px rgba(0,0,0,.12); display: flex; flex-direction: column; gap: 14px; }
+    .ct-head { display: flex; align-items: center; gap: 12px; }
+    .ct-head .ct-title { flex: 1; min-width: 0; }
+    .ct-head strong { font-size: 15px; }
+    .ct-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+    .ct-stats > div > label { margin: 0 0 2px; }
+    .ct-addr { min-height: 18px; }
+    .ct-foot { display: flex; gap: 6px; flex-wrap: wrap; border-top: 1px solid var(--border); padding-top: 12px; }
+    .ct-foot button { padding: 5px 12px; }
+    .view-toggle { margin-left: auto; display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+    .view-toggle button { border: 0; border-radius: 0; background: transparent; padding: 7px 14px; }
+    .view-toggle button.on { background: var(--btn-hover); color: var(--text); font-weight: 600; }
+    .bulk { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
     .menu {
       position: fixed; z-index: 70; min-width: 110px; padding: 4px;
       background: var(--panel-solid); border: 1px solid var(--border); border-radius: 8px;
@@ -355,11 +369,16 @@
             </tbody>
           </table>
         </div>
+        <div class="cards hidden" id="ct-cards"></div>
         <div class="bulk" id="bulk">
           <button data-bulk="start">全部启动</button>
           <button data-bulk="stop">全部停止</button>
           <button data-bulk="freeze">全部冻结</button>
           <button data-bulk="unfreeze">全部解冻</button>
+          <div class="view-toggle" id="view-toggle">
+            <button data-view="table">列表</button>
+            <button data-view="cards">卡片</button>
+          </div>
         </div>
       </div>
 
@@ -672,55 +691,98 @@
     }
 
     let containers = [], lastSig = "";
+    let viewMode = localStorage.getItem("fnlxc-view") === "cards" ? "cards" : "table";
+
+    function ctParts(c) {
+      const st = (c.state || "").toUpperCase();
+      const n = esc(c.name);
+      const sw = `<label class="switch" title="开机自动启动"><input type="checkbox" data-a="autostart" data-n="${n}" ${c.autostart ? "checked" : ""}><span></span></label>`;
+      const btns = (extra) =>
+        (st === "RUNNING" ? `<button data-a="term" data-n="${n}" class="primary">终端</button>` : "") +
+        `<button data-a="cfg" data-n="${n}">配置</button>` +
+        (st === "RUNNING" ? `<button data-a="stop" data-n="${n}">停止</button>`
+          : st === "FROZEN" ? `<button data-a="unfreeze" data-n="${n}">解冻</button>`
+          : `<button data-a="start" data-n="${n}">启动</button>`) +
+        `<button data-a="more" data-n="${n}" data-st="${st}">更多 ▾</button>`;
+      const title = `<strong>${n}</strong><div class="distro">${esc(c.distro)}${c.release ? " " + esc(c.release) : ""}</div>`;
+      return { n, sw, btns, title };
+    }
+
+    function rowHtml(c) {
+      const { n, sw, btns, title } = ctParts(c);
+      return `<tr data-name="${n}">
+          <td>${distroIcon(c.distro, c.name, c.webui)}</td>
+          <td>${title}</td>
+          <td>${stateBadge(c.state)}</td>
+          <td class="stat" data-k="cpu">${statCpu(c)}</td>
+          <td class="stat" data-k="mem">${statMem(c)}</td>
+          <td>${addrCell(c)}</td>
+          <td class="stat" data-k="net">${statNet(c)}</td>
+          <td>${sw}</td>
+          <td class="stat" data-k="up">${statUp(c)}</td>
+          <td class="actions">${btns()}</td>
+        </tr>`;
+    }
+
+    function cardHtml(c) {
+      const { n, sw, btns, title } = ctParts(c);
+      return `<div class="ct-card" data-name="${n}">
+          <div class="ct-head">
+            ${distroIcon(c.distro, c.name, c.webui)}
+            <div class="ct-title">${title}</div>
+            ${stateBadge(c.state)}
+            ${sw}
+          </div>
+          <div class="ct-stats">
+            <div><label>CPU</label><div class="stat" data-k="cpu">${statCpu(c)}</div></div>
+            <div><label>内存</label><div class="stat" data-k="mem">${statMem(c)}</div></div>
+            <div><label>流量</label><div class="stat" data-k="net">${statNet(c)}</div></div>
+            <div><label>运行</label><div class="stat" data-k="up">${statUp(c)}</div></div>
+          </div>
+          <div class="ct-addr">${addrCell(c)}</div>
+          <div class="ct-foot">${btns()}</div>
+        </div>`;
+    }
+
     async function loadContainers() {
       const data = await api("/api/containers");
       const list = data.containers || [];
-      const tb = $("#ct-body");
-      const sig = JSON.stringify(list.map(({ stats, ...rest }) => rest));
+      const sig = viewMode + JSON.stringify(list.map(({ stats, ...rest }) => rest));
       containers = list;
       if (sig === lastSig) {
         list.forEach((c) => {
-          const tr = tb.querySelector(`tr[data-name="${CSS.escape(c.name)}"]`);
-          if (!tr) return;
+          const el = $("#tab-list").querySelector(`[data-name="${CSS.escape(c.name)}"]`);
+          if (!el) return;
           for (const [k, fn] of Object.entries(STAT_CELLS)) {
-            const td = tr.querySelector(`[data-k="${k}"]`);
-            if (td) td.innerHTML = fn(c);
+            const cell = el.querySelector(`[data-k="${k}"]`);
+            if (cell) cell.innerHTML = fn(c);
           }
         });
         return;
       }
       lastSig = sig;
       closeMenu();
-      if (!containers.length) {
-        tb.innerHTML = `<tr><td colspan="10" class="empty">暂无容器。点击右上角「添加容器」开始。</td></tr>`;
-        return;
+      const cards = viewMode === "cards";
+      $("#ct-cards").classList.toggle("hidden", !cards);
+      $("#ct-body").closest(".card").classList.toggle("hidden", cards);
+      $$("#view-toggle button").forEach((b) => b.classList.toggle("on", b.dataset.view === viewMode));
+      const empty = `暂无容器。点击右上角「添加容器」开始。`;
+      $(cards ? "#ct-body" : "#ct-cards").innerHTML = "";
+      if (cards) {
+        $("#ct-cards").innerHTML = containers.length ? containers.map(cardHtml).join("") : `<div class="empty" style="grid-column:1/-1">${empty}</div>`;
+      } else {
+        $("#ct-body").innerHTML = containers.length ? containers.map(rowHtml).join("") : `<tr><td colspan="10" class="empty">${empty}</td></tr>`;
       }
-      tb.innerHTML = containers.map((c) => {
-        const st = (c.state || "").toUpperCase();
-        const running = st === "RUNNING";
-        const frozen = st === "FROZEN";
-        const n = esc(c.name);
-        return `<tr data-name="${n}">
-          <td>${distroIcon(c.distro, c.name, c.webui)}</td>
-          <td><strong>${n}</strong><div class="distro">${esc(c.distro)}${c.release ? " " + esc(c.release) : ""}</div></td>
-          <td>${stateBadge(c.state)}</td>
-          <td class="stat" data-k="cpu">${statCpu(c)}</td>
-          <td class="stat" data-k="mem">${statMem(c)}</td>
-          <td>${addrCell(c)}</td>
-          <td class="stat" data-k="net">${statNet(c)}</td>
-          <td><label class="switch" title="开机自动启动"><input type="checkbox" data-a="autostart" data-n="${n}" ${c.autostart ? "checked" : ""}><span></span></label></td>
-          <td class="stat" data-k="up">${statUp(c)}</td>
-          <td class="actions">
-            ${running ? `<button data-a="term" data-n="${n}" class="primary">终端</button>` : ""}
-            <button data-a="cfg" data-n="${n}">配置</button>
-            ${running ? `<button data-a="stop" data-n="${n}">停止</button>`
-              : frozen ? `<button data-a="unfreeze" data-n="${n}">解冻</button>`
-              : `<button data-a="start" data-n="${n}">启动</button>`}
-            <button data-a="more" data-n="${n}" data-st="${st}">更多 ▾</button>
-          </td>
-        </tr>`;
-      }).join("");
     }
+
+    $("#view-toggle").addEventListener("click", (e) => {
+      const b = e.target.closest("button[data-view]");
+      if (!b || b.dataset.view === viewMode) return;
+      viewMode = b.dataset.view;
+      localStorage.setItem("fnlxc-view", viewMode);
+      lastSig = "";
+      loadContainers();
+    });
 
     const menu = $("#more-menu");
     function closeMenu() { menu.classList.add("hidden"); menu.innerHTML = ""; }
@@ -748,7 +810,7 @@
     });
     window.addEventListener("scroll", closeMenu, true);
 
-    $("#ct-body").addEventListener("click", (e) => {
+    $("#tab-list").addEventListener("click", (e) => {
       const btn = e.target.closest("button[data-a]");
       if (btn) {
         const a = btn.dataset.a, n = btn.dataset.n;
@@ -763,7 +825,7 @@
       const cp = e.target.closest("[data-copy]");
       if (cp) copyText(cp.dataset.copy).then((ok) => toast(ok ? "已复制 " + cp.dataset.copy : "复制失败，请手动选中复制"));
     });
-    $("#ct-body").addEventListener("change", async (e) => {
+    $("#tab-list").addEventListener("change", async (e) => {
       const cb = e.target.closest("input[data-a=autostart]");
       if (!cb) return;
       cb.disabled = true;
