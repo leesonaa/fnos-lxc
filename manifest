@@ -1,5 +1,5 @@
 appname=fnos-lxc
-version=1.0.11
+version=1.0.12
 display_name=LXC 容器
 desc=原生 LXC 容器管理，。安装后引导完成初始化，即可在管理界面创建、启停、快照、终端访问容器。支持 x86 / ARM 全架构。
 source=thirdparty
@@ -14,4 +14,4 @@ desktop_applaunchname=fnos-lxc.Application
 ctl_stop=true
 checkport=false
 service_port=9100
-changelog=内存列增加占用百分比，流量上下行箭头对齐
+changelog=CPU 与内存改为数值加进度条展示，内存显示详细用量（如 42.3M / 15.4G）

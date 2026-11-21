@@ -222,6 +222,11 @@
     .term-box .xterm-viewport::-webkit-scrollbar-thumb { background: #3a4150; border-radius: 4px; }
     .term-box .xterm { padding: 6px 12px 6px 6px; }
     .stat { white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .stat b { font-weight: 500; }
+    .meter { height: 4px; width: 84px; margin: 4px auto 3px; border-radius: 2px; background: var(--pbar-bg); overflow: hidden; }
+    .meter > i { display: block; height: 100%; min-width: 2px; border-radius: 2px; background: var(--green); transition: width .4s; }
+    .meter > i.mid { background: var(--orange); }
+    .meter > i.hi { background: var(--red); }
     .kv { display: inline-grid; grid-template-columns: auto auto; gap: 0 6px; text-align: left; justify-content: center; line-height: 1.5; }
     .kv i { font-style: normal; color: var(--muted); }
     .kv b { font-weight: 400; }
@@ -660,12 +665,14 @@
       window.open(url, "_blank", "noopener");
     }
 
-    const fmtBytes = (n) => {
+    const fmtBytes = (n, precise) => {
       if (n == null) return "-";
       const u = ["B", "K", "M", "G", "T"];
       let i = 0;
       while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
-      const v = n >= 10 || i === 0 ? Math.round(n) : n.toFixed(1).replace(/\.0$/, "");
+      const v = i === 0 ? Math.round(n)
+        : precise ? n.toFixed(1)
+        : n >= 10 ? Math.round(n) : n.toFixed(1).replace(/\.0$/, "");
       return v + u[i];
     };
     const fmtUptime = (sec) => {
@@ -675,13 +682,21 @@
       if (sec >= 60) return Math.floor(sec / 60) + "m";
       return sec + "s";
     };
-    const statCpu = (c) => c.stats ? `${c.stats.cpu == null ? "-" : c.stats.cpu + "%"}<small>核 ${esc(c.stats.cpus)}</small>` : "-";
+    const meter = (pct) => {
+      const v = Math.max(0, Math.min(100, pct || 0));
+      return `<div class="meter"><i class="${v >= 85 ? "hi" : v >= 60 ? "mid" : ""}" style="width:${v.toFixed(1)}%"></i></div>`;
+    };
+    const fmtPct = (v) => (v >= 10 ? Math.round(v) : v.toFixed(1).replace(/\.0$/, "")) + "%";
+    const statCpu = (c) => {
+      if (!c.stats) return "-";
+      const v = c.stats.cpu;
+      return `<b>${v == null ? "-" : fmtPct(v)}</b>${meter(v)}<small>核 ${esc(c.stats.cpus)}</small>`;
+    };
     const statMem = (c) => {
       const t = c.stats;
       if (!t || t.mem == null) return "-";
-      const pct = t.mem_max ? t.mem / t.mem_max * 100 : null;
-      const pctText = pct == null ? "不限" : (pct >= 10 ? Math.round(pct) : pct.toFixed(1)) + "%";
-      return `${fmtBytes(t.mem)}/${t.mem_max ? fmtBytes(t.mem_max) : "∞"}<small>${pctText}</small>`;
+      const pct = t.mem_max ? t.mem / t.mem_max * 100 : 0;
+      return `<b>${fmtBytes(t.mem, true)} / ${t.mem_max ? fmtBytes(t.mem_max, true) : "不限"}</b>${meter(pct)}<small>${t.mem_max ? fmtPct(pct) : "无上限"}</small>`;
     };
     const statNet = (c) => c.stats && c.stats.rx != null
       ? `<span class="kv"><i>↓</i><b>${fmtBytes(c.stats.rx)}</b><i>↑</i><b class="tx">${fmtBytes(c.stats.tx)}</b></span>` : "-";
