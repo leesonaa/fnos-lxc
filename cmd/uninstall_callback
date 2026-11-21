@@ -2,25 +2,67 @@
 # wizard/uninstall 的 keep_data 开关以 wizard_keep_data 传入（"true"/"false"）
 DATA_DIR="${TRIM_PKGVAR:-/vol1/@appdata/fnos-lxc}"
 
+# 取初始化时用户选择的容器存储路径（config.json 的 lxcpath），没有则用 lxc 当前配置
+get_lxcpath() {
+  local p=""
+  if [ -f "${DATA_DIR}/config.json" ] && command -v python3 >/dev/null 2>&1; then
+    p="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("lxcpath") or "")' "${DATA_DIR}/config.json" 2>/dev/null)"
+  fi
+  [ -z "$p" ] && command -v lxc-config >/dev/null 2>&1 && p="$(lxc-config lxc.lxcpath 2>/dev/null)"
+  echo "${p:-/var/lib/lxc}"
+}
+
+# 与初始化时 check_lxcpath 的规则一致：绝对路径、至少两级、不在系统目录下，绝不删 /vol1、/ 等
+safe_to_remove() {
+  local p="${1%/}"
+  case "$p" in /*) ;; *) return 1 ;; esac
+  case "$p" in *..*|*[[:cntrl:]]*) return 1 ;; esac
+  [ "$(echo "$p" | tr -cd / | wc -c)" -ge 2 ] || return 1
+  local d
+  for d in /etc /usr /bin /sbin /lib /lib64 /boot /proc /sys /dev /run /root /var /home; do
+    case "$p" in "$d"|"$d"/*) return 1 ;; esac
+  done
+  return 0
+}
+
 if [ "${wizard_keep_data:-true}" = "false" ]; then
-  # 只清理由本应用管理的容器（config 里有 fnos-lxc 受管区块），不碰用户其它来源的 LXC 容器
-  if command -v lxc-ls >/dev/null 2>&1; then
-    LXCPATH="$(lxc-config lxc.lxcpath 2>/dev/null || echo /var/lib/lxc)"
-    for n in $(lxc-ls -1 2>/dev/null); do
-      if grep -q "fnos-lxc managed" "${LXCPATH}/${n}/config" 2>/dev/null; then
-        lxc-stop -n "$n" -k 2>/dev/null || true
-        lxc-destroy -n "$n" -f 2>/dev/null || true
-      else
-        echo "skip container not managed by fnos-lxc: $n"
-      fi
+  LXCPATH="$(get_lxcpath)"
+  LXCPATH="${LXCPATH%/}"
+
+  # 1) 停止并销毁该存储路径下的全部容器（该路径由本应用在初始化时指定，专用于 LXC）
+  if command -v lxc-ls >/dev/null 2>&1 && [ -d "$LXCPATH" ]; then
+    for n in $(lxc-ls -P "$LXCPATH" -1 2>/dev/null); do
+      lxc-stop -P "$LXCPATH" -n "$n" -k 2>/dev/null || true
+      lxc-destroy -P "$LXCPATH" -n "$n" -f -s 2>/dev/null || true
     done
   fi
-  # 还原初始化时备份的宿主机 LXC 配置
+
+  # 2) 还原初始化时备份的宿主机 LXC 配置
   for f in lxc.conf default.conf; do
     if [ -f "${DATA_DIR}/orig/${f}" ]; then
       cp -f "${DATA_DIR}/orig/${f}" "/etc/lxc/${f}" 2>/dev/null || true
     fi
   done
+
+  # 3) 删除存储目录本身（含 cache）；先确认没有残留挂载，避免 rm 穿透到挂载的数据
+  if [ -d "$LXCPATH" ]; then
+    if ! safe_to_remove "$LXCPATH"; then
+      echo "skip removing storage dir (unsafe path): $LXCPATH"
+    elif grep -qs " ${LXCPATH}/" /proc/mounts; then
+      echo "skip removing storage dir (still mounted): $LXCPATH"
+    else
+      # 指向该目录的 /var/lib/lxc、/var/cache/lxc 软链一并清理
+      for l in /var/lib/lxc /var/cache/lxc; do
+        if [ -L "$l" ]; then
+          t="$(readlink -f "$l" 2>/dev/null)"
+          case "$t" in "$LXCPATH"|"$LXCPATH"/*) rm -f "$l" ;; esac
+        fi
+      done
+      rm -rf --one-file-system "$LXCPATH" 2>/dev/null || true
+      [ -d "$LXCPATH" ] && echo "warning: failed to fully remove $LXCPATH"
+    fi
+  fi
+
   rm -rf "${DATA_DIR}" 2>/dev/null || true
 fi
 echo "fnos-lxc uninstall_callback ok"
