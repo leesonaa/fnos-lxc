@@ -35,6 +35,7 @@ _DEV_TUN = "c 10:200 rwm"
 _DEV_FUSE = "c 10:229 rwm"
 _DEV_DRI = "c 226:* rwm"
 
+_WEBUI_RE = re.compile(r"^#\s*fnos\.webui\s*=\s*(.*)$", re.M)
 _HOST_RE = re.compile(r"^[A-Za-z0-9._-]{1,63}$")
 _BRIDGE_RE = re.compile(r"^[A-Za-z0-9._:-]{1,15}$")
 _MAC_RE = re.compile(r"^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$")
@@ -43,6 +44,7 @@ DEFAULTS = {
     "autostart": False,
     "start_delay": 5,
     "hostname": "",
+    "webui": "",  # 点击图标打开的地址，支持 [IP] 占位符
     "bridge": "",
     "hwaddr": "",
     "ipv4_mode": "dhcp",  # dhcp | static
@@ -102,6 +104,9 @@ def parse_settings(text: str) -> dict:
     s = dict(DEFAULTS)
     s["mounts"] = []
     allow = []
+    m = _WEBUI_RE.search(text)
+    if m:
+        s["webui"] = m.group(1).strip()
     for _, k, v in _kv_lines(text):
         if k == "lxc.start.auto":
             s["autostart"] = v == "1"
@@ -198,6 +203,11 @@ def validate(raw: dict) -> tuple[dict | None, str]:
     if host and not _HOST_RE.match(host):
         return None, "主机名只能包含字母、数字、. _ -"
     s["hostname"] = host
+
+    webui = str(raw.get("webui") or "").strip()
+    if webui and (not re.match(r"^https?://[^\s]+$", webui) or len(webui) > 500):
+        return None, "WebUI 地址需以 http:// 或 https:// 开头，且不含空格"
+    s["webui"] = webui
 
     br = str(raw.get("bridge") or "").strip()
     if not br or not _BRIDGE_RE.match(br):
@@ -314,6 +324,8 @@ def build_block(s: dict, bind_is_file=lambda p: False) -> list[str]:
         L.append(f"lxc.start.delay = {s['start_delay']}")
     if s["hostname"]:
         L.append(f"lxc.uts.name = {s['hostname']}")
+    if s["webui"]:
+        L.append(f"# fnos.webui = {s['webui']}")
     L += [
         "lxc.net.0.type = veth",
         "lxc.net.0.flags = up",

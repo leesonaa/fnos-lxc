@@ -93,6 +93,8 @@
       width: 30px; height: 30px; border-radius: 7px; padding: 5px;
       background: #e8eaed; display: inline-flex; align-items: center; justify-content: center;
     }
+    .webui-btn { cursor: pointer; }
+    .webui-btn:hover { filter: brightness(1.15); outline: 1px solid var(--blue); }
     .icon img { width: 100%; height: 100%; display: block; }
     .distro { color: var(--muted); font-size: 12px; }
     .ip { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; cursor: pointer; word-break: break-all; }
@@ -145,13 +147,13 @@
     details summary { cursor: pointer; color: var(--muted); margin-bottom: 10px; }
     textarea.raw { width: 100%; height: 220px; background: #0c0e12; color: #c9d1d9; border: 1px solid var(--border); border-radius: 8px; padding: 10px; font: 12px ui-monospace, Menlo, Consolas, monospace; }
     .modal.term { width: min(1000px, 96vw); height: min(640px, 90vh); display: flex; flex-direction: column; padding: 14px; background: #0a0b0d; }
-    .term-box { flex: 1; min-height: 0; padding: 6px; background: #0a0b0d; border-radius: 6px; overflow: hidden; }
+    .term-box { flex: 1; min-height: 0; padding: 0; background: #0a0b0d; border-radius: 6px; overflow: hidden; }
     .term-box .xterm { height: 100%; }
     .term-box .xterm-viewport { background-color: transparent !important; scrollbar-width: thin; scrollbar-color: #3a4150 transparent; }
     .term-box .xterm-viewport::-webkit-scrollbar { width: 8px; }
     .term-box .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
     .term-box .xterm-viewport::-webkit-scrollbar-thumb { background: #3a4150; border-radius: 4px; }
-    .term-box .xterm { padding: 0 12px 0 4px; }
+    .term-box .xterm { padding: 6px 12px 6px 6px; }
     .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
     .tab {
       padding: 8px 14px; cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent;
@@ -342,6 +344,7 @@
         <fieldset>
           <legend>基本</legend>
           <div class="grid2">
+            <div class="field" style="grid-column:1/-1"><label>WebUI 地址（点击容器图标打开，可用 [IP] 代表容器 IPv4）</label><input type="text" id="c-webui" placeholder="http://[IP]:8080" /></div>
             <div class="field"><label>主机名</label><input type="text" id="c-hostname" placeholder="留空则与容器名相同" /></div>
             <div class="field"><label>自启延迟（秒）</label><input type="number" id="c-delay" min="0" max="600" /></div>
           </div>
@@ -497,9 +500,9 @@
       archlinux: "archlinux", arch: "archlinux", opensuse: "opensuse", "opensuse-leap": "opensuse", rockylinux: "rockylinux", rocky: "rockylinux",
       almalinux: "almalinux", kali: "kalilinux", mint: "linuxmint", linuxmint: "linuxmint", gentoo: "gentoo", voidlinux: "voidlinux",
       void: "voidlinux", nixos: "nixos", rhel: "redhat", openwrt: "openwrt" };
-    function distroIcon(d) {
+    function distroIcon(d, name, webui) {
       const slug = ICONS[(d || "").toLowerCase()] || "linux";
-      return `<span class="icon"><img src="icons/${slug}.svg" alt="${esc(d)}" title="${esc(d)}" onerror="this.onerror=null;this.src='icons/linux.svg'"></span>`;
+      return `<span class="icon webui-btn" data-webui="${esc(name || "")}" title="${webui ? "打开 WebUI：" + esc(webui) : "点击设置 WebUI 地址"}"><img src="icons/${slug}.svg" alt="${esc(d)}" onerror="this.onerror=null;this.src='icons/linux.svg'"></span>`;
     }
 
     function ipCell(list, cls) {
@@ -517,6 +520,24 @@
       try { ok = document.execCommand("copy"); } catch (e) {}
       ta.remove();
       return ok;
+    }
+
+    async function openWebUI(name) {
+      const c = containers.find((x) => x.name === name);
+      if (!c) return;
+      if (!c.webui) {
+        await openConfig(name);
+        toast("请填写 WebUI 地址，保存后点击图标即可打开");
+        cv("c-webui").focus();
+        return;
+      }
+      let url = c.webui;
+      if (url.includes("[IP]")) {
+        const ip = ((c.ipv4 || [])[0] || "").split("/")[0];
+        if (!ip) { toast("容器暂无 IPv4 地址，无法打开"); return; }
+        url = url.replaceAll("[IP]", ip);
+      }
+      window.open(url, "_blank", "noopener");
     }
 
     let containers = [], lastSig = "";
@@ -537,7 +558,7 @@
         const frozen = st === "FROZEN";
         const n = esc(c.name);
         return `<tr>
-          <td>${distroIcon(c.distro)}</td>
+          <td>${distroIcon(c.distro, c.name, c.webui)}</td>
           <td><strong>${n}</strong><div class="distro">${esc(c.distro)}${c.release ? " " + esc(c.release) : ""}</div></td>
           <td>${stateBadge(c.state)}</td>
           <td>${ipCell(c.ipv4)}</td>
@@ -565,6 +586,9 @@
           else if (a === "term") openTerm(n);
           else onAction(n, a);
         });
+      });
+      tb.querySelectorAll(".webui-btn").forEach((el) => {
+        el.addEventListener("click", () => openWebUI(el.dataset.webui));
       });
       tb.querySelectorAll("[data-copy]").forEach((el) => {
         el.addEventListener("click", () => {
@@ -843,6 +867,7 @@
       cv("cfg-running").classList.toggle("hidden", !running);
       cv("cfg-save-restart").classList.toggle("hidden", !running);
       cv("c-hostname").value = s.hostname || "";
+      cv("c-webui").value = s.webui || "";
       cv("c-delay").value = s.start_delay ?? 5;
       cv("c-autostart").checked = !!s.autostart;
       fillBridges(cv("c-bridge"), r.bridges, s.bridge || "");
@@ -863,6 +888,7 @@
     function collectForm() {
       return {
         hostname: cv("c-hostname").value.trim(),
+        webui: cv("c-webui").value.trim(),
         start_delay: +cv("c-delay").value || 0,
         autostart: cv("c-autostart").checked,
         bridge: cv("c-bridge").value,

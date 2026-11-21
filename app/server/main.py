@@ -309,6 +309,11 @@ def list_containers() -> list:
     def fill(c):
         c["ipv4"], c["ipv6"] = container_ips(c["name"]) if c["state"] == "RUNNING" else ([], [])
         c["distro"], c["release"] = detect_distro(c["name"])
+        p = ct_config_path(c["name"])
+        try:
+            c["webui"] = lxcconf.parse_settings(p.read_text(errors="ignore"))["webui"] if p else ""
+        except OSError:
+            c["webui"] = ""
         return c
 
     with ThreadPoolExecutor(max_workers=8) as ex:
