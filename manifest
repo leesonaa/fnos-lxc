@@ -1,5 +1,5 @@
 appname=fnos-lxc
-version=1.0.4
+version=1.0.5
 display_name=LXC 容器
 desc=原生 LXC 容器管理，。安装后引导完成初始化，即可在管理界面创建、启停、快照、终端访问容器。支持 x86 / ARM 全架构。
 source=thirdparty
@@ -14,4 +14,4 @@ desktop_applaunchname=fnos-lxc.Application
 ctl_stop=true
 checkport=false
 service_port=9100
-changelog=新增浅色 / 深色 / 跟随系统主题切换与毛玻璃界面
+changelog=列表新增 CPU/内存/流量/运行时长、自启开关、批量操作与更多菜单

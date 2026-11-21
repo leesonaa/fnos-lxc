@@ -154,7 +154,7 @@
     .webui-btn { cursor: pointer; }
     .webui-btn:hover { filter: brightness(1.15); outline: 1px solid var(--blue); }
     .icon img { width: 100%; height: 100%; display: block; }
-    .distro { color: var(--muted); font-size: 12px; }
+    .distro { color: var(--muted); font-size: 12px; white-space: nowrap; }
     .ip { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; cursor: pointer; word-break: break-all; }
     .ip6 { font-size: 11px; max-width: 230px; }
     .steps { display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; }
@@ -215,6 +215,27 @@
     .term-box .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
     .term-box .xterm-viewport::-webkit-scrollbar-thumb { background: #3a4150; border-radius: 4px; }
     .term-box .xterm { padding: 6px 12px 6px 6px; }
+    .stat { white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .stat small, td small { display: block; color: var(--muted); font-size: 11px; }
+    .mbar { height: 4px; width: 90px; border-radius: 2px; background: var(--pbar-bg); overflow: hidden; margin-top: 3px; }
+    .mbar > i { display: block; height: 100%; background: var(--blue); }
+    td.actions { white-space: nowrap; }
+    .switch { position: relative; display: inline-block; width: 36px; height: 20px; margin: 0; vertical-align: middle; cursor: pointer; }
+    .switch input { opacity: 0; width: 0; height: 0; min-width: 0; position: absolute; }
+    .switch span { position: absolute; inset: 0; border-radius: 10px; background: var(--btn-hover); transition: background .15s; }
+    .switch span::after { content: ""; position: absolute; left: 3px; top: 3px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: transform .15s; box-shadow: 0 1px 3px rgba(0,0,0,.3); }
+    .switch input:checked + span { background: #2563eb; }
+    .switch input:checked + span::after { transform: translateX(16px); }
+    .switch input:disabled + span { opacity: .5; }
+    .bulk { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+    .menu {
+      position: fixed; z-index: 70; min-width: 110px; padding: 4px;
+      background: var(--panel-solid); border: 1px solid var(--border); border-radius: 8px;
+      box-shadow: 0 10px 30px rgba(0,0,0,.35);
+    }
+    .menu button { display: block; width: 100%; text-align: left; margin: 0; background: transparent; border: 0; padding: 7px 10px; }
+    .menu button:hover { background: var(--btn-hover); }
+    .menu button.danger { color: var(--red); background: transparent; }
     .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
     .tab {
       padding: 8px 14px; cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent;
@@ -320,16 +341,25 @@
                 <th style="width:40px"></th>
                 <th>名称</th>
                 <th>状态</th>
-                <th>IPv4</th>
-                <th>IPv6</th>
+                <th>CPU</th>
+                <th>内存</th>
+                <th>地址</th>
+                <th>流量</th>
                 <th>自启</th>
+                <th>运行</th>
                 <th>操作</th>
               </tr>
             </thead>
             <tbody id="ct-body">
-              <tr><td colspan="7" class="empty">加载中…</td></tr>
+              <tr><td colspan="10" class="empty">加载中…</td></tr>
             </tbody>
           </table>
+        </div>
+        <div class="bulk" id="bulk">
+          <button data-bulk="start">全部启动</button>
+          <button data-bulk="stop">全部停止</button>
+          <button data-bulk="freeze">全部冻结</button>
+          <button data-bulk="unfreeze">全部解冻</button>
         </div>
       </div>
 
@@ -504,6 +534,7 @@
     </div>
   </div>
 
+  <div class="menu hidden" id="more-menu"></div>
   <div class="toast hidden" id="toast"></div>
 
   <script src="vendor/xterm.js"></script>
@@ -609,16 +640,59 @@
       window.open(url, "_blank", "noopener");
     }
 
+    const fmtBytes = (n) => {
+      if (n == null) return "-";
+      const u = ["B", "KiB", "MiB", "GiB", "TiB"];
+      let i = 0;
+      while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+      return (i === 0 ? n : n.toFixed(n >= 100 ? 0 : 2)) + " " + u[i];
+    };
+    const fmtUptime = (sec) => {
+      if (sec == null) return "-";
+      if (sec >= 86400) return Math.floor(sec / 86400) + " 天 " + Math.floor(sec % 86400 / 3600) + " 时";
+      if (sec >= 3600) return Math.floor(sec / 3600) + " 时 " + Math.floor(sec % 3600 / 60) + " 分";
+      if (sec >= 60) return Math.floor(sec / 60) + " 分钟";
+      return sec + " 秒";
+    };
+    const statCpu = (c) => c.stats ? `${c.stats.cpu == null ? "-" : c.stats.cpu + "%"}<small>核 ${esc(c.stats.cpus)}</small>` : "-";
+    const statMem = (c) => {
+      const t = c.stats;
+      if (!t || t.mem == null) return "-";
+      const pct = t.mem_max ? Math.min(100, t.mem / t.mem_max * 100) : 0;
+      return `${fmtBytes(t.mem)}<small>/ ${t.mem_max ? fmtBytes(t.mem_max) : "不限"}</small>${t.mem_max ? `<div class="mbar"><i style="width:${pct.toFixed(1)}%"></i></div>` : ""}`;
+    };
+    const statNet = (c) => c.stats && c.stats.rx != null ? `↓ ${fmtBytes(c.stats.rx)}<small>↑ ${fmtBytes(c.stats.tx)}</small>` : "-";
+    const statUp = (c) => c.stats ? `${fmtUptime(c.stats.uptime)}<small>PID ${c.stats.pid}</small>` : "-";
+    const STAT_CELLS = { cpu: statCpu, mem: statMem, net: statNet, up: statUp };
+
+    function addrCell(c) {
+      const v4 = c.ipv4 || [], v6 = c.ipv6 || [];
+      if (!v4.length && !v6.length) return "-";
+      return (v4.length ? ipCell(v4) : "") + (v6.length ? ipCell(v6, "ip6") : "");
+    }
+
     let containers = [], lastSig = "";
     async function loadContainers() {
       const data = await api("/api/containers");
+      const list = data.containers || [];
       const tb = $("#ct-body");
-      const sig = JSON.stringify(data.containers || []);
-      if (sig === lastSig) return;
+      const sig = JSON.stringify(list.map(({ stats, ...rest }) => rest));
+      containers = list;
+      if (sig === lastSig) {
+        list.forEach((c) => {
+          const tr = tb.querySelector(`tr[data-name="${CSS.escape(c.name)}"]`);
+          if (!tr) return;
+          for (const [k, fn] of Object.entries(STAT_CELLS)) {
+            const td = tr.querySelector(`[data-k="${k}"]`);
+            if (td) td.innerHTML = fn(c);
+          }
+        });
+        return;
+      }
       lastSig = sig;
-      containers = data.containers || [];
+      closeMenu();
       if (!containers.length) {
-        tb.innerHTML = `<tr><td colspan="7" class="empty">暂无容器。点击右上角「添加容器」开始。</td></tr>`;
+        tb.innerHTML = `<tr><td colspan="10" class="empty">暂无容器。点击右上角「添加容器」开始。</td></tr>`;
         return;
       }
       tb.innerHTML = containers.map((c) => {
@@ -626,53 +700,104 @@
         const running = st === "RUNNING";
         const frozen = st === "FROZEN";
         const n = esc(c.name);
-        return `<tr>
+        return `<tr data-name="${n}">
           <td>${distroIcon(c.distro, c.name, c.webui)}</td>
           <td><strong>${n}</strong><div class="distro">${esc(c.distro)}${c.release ? " " + esc(c.release) : ""}</div></td>
           <td>${stateBadge(c.state)}</td>
-          <td>${ipCell(c.ipv4)}</td>
-          <td>${ipCell(c.ipv6, "ip6")}</td>
-          <td>${c.autostart ? "yes" : "no"}</td>
+          <td class="stat" data-k="cpu">${statCpu(c)}</td>
+          <td class="stat" data-k="mem">${statMem(c)}</td>
+          <td>${addrCell(c)}</td>
+          <td class="stat" data-k="net">${statNet(c)}</td>
+          <td><label class="switch" title="开机自动启动"><input type="checkbox" data-a="autostart" data-n="${n}" ${c.autostart ? "checked" : ""}><span></span></label></td>
+          <td class="stat" data-k="up">${statUp(c)}</td>
           <td class="actions">
             ${running ? `<button data-a="term" data-n="${n}" class="primary">终端</button>` : ""}
             <button data-a="cfg" data-n="${n}">配置</button>
-            ${running
-              ? `<button data-a="stop" data-n="${n}">停止</button>
-                 <button data-a="kill" data-n="${n}">强杀</button>
-                 <button data-a="freeze" data-n="${n}">冻结</button>`
-              : frozen
-              ? `<button data-a="unfreeze" data-n="${n}">解冻</button>`
-              : `<button data-a="start" data-n="${n}">启动</button>`
-            }
-            <button data-a="destroy" data-n="${n}" class="danger">删除</button>
+            ${running ? `<button data-a="stop" data-n="${n}">停止</button>`
+              : frozen ? `<button data-a="unfreeze" data-n="${n}">解冻</button>`
+              : `<button data-a="start" data-n="${n}">启动</button>`}
+            <button data-a="more" data-n="${n}" data-st="${st}">更多 ▾</button>
           </td>
         </tr>`;
       }).join("");
-      tb.querySelectorAll("button[data-a]").forEach((btn) => {
-        btn.addEventListener("click", () => {
-          const a = btn.dataset.a, n = btn.dataset.n;
-          if (a === "cfg") openConfig(n);
-          else if (a === "term") openTerm(n);
-          else onAction(n, a);
-        });
-      });
-      tb.querySelectorAll(".webui-btn").forEach((el) => {
-        el.addEventListener("click", () => openWebUI(el.dataset.webui));
-      });
-      tb.querySelectorAll("[data-copy]").forEach((el) => {
-        el.addEventListener("click", () => {
-          copyText(el.dataset.copy).then((ok) => toast(ok ? "已复制 " + el.dataset.copy : "复制失败，请手动选中复制"));
-        });
-      });
     }
+
+    const menu = $("#more-menu");
+    function closeMenu() { menu.classList.add("hidden"); menu.innerHTML = ""; }
+    function openMenu(btn) {
+      const n = btn.dataset.n, st = btn.dataset.st;
+      const items = [];
+      if (st === "RUNNING") items.push(["kill", "强制停止"], ["freeze", "冻结"]);
+      else if (st === "FROZEN") items.push(["kill", "强制停止"]);
+      items.push(["destroy", "删除", "danger"]);
+      menu.innerHTML = items.map(([a, t, cls]) => `<button data-a="${a}" class="${cls || ""}">${t}</button>`).join("");
+      menu.classList.remove("hidden");
+      const r = btn.getBoundingClientRect();
+      const mh = menu.offsetHeight, mw = menu.offsetWidth;
+      menu.style.left = Math.max(8, Math.min(r.right - mw, innerWidth - mw - 8)) + "px";
+      menu.style.top = (r.bottom + mh + 8 > innerHeight ? r.top - mh - 4 : r.bottom + 4) + "px";
+      menu.onclick = (e) => {
+        const b = e.target.closest("button[data-a]");
+        if (!b) return;
+        closeMenu();
+        onAction(n, b.dataset.a);
+      };
+    }
+    document.addEventListener("click", (e) => {
+      if (!e.target.closest("#more-menu") && !e.target.closest("button[data-a=more]")) closeMenu();
+    });
+    window.addEventListener("scroll", closeMenu, true);
+
+    $("#ct-body").addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-a]");
+      if (btn) {
+        const a = btn.dataset.a, n = btn.dataset.n;
+        if (a === "cfg") openConfig(n);
+        else if (a === "term") openTerm(n);
+        else if (a === "more") { const open = !menu.classList.contains("hidden"); closeMenu(); if (!open) openMenu(btn); }
+        else onAction(n, a, btn);
+        return;
+      }
+      const web = e.target.closest(".webui-btn");
+      if (web) { openWebUI(web.dataset.webui); return; }
+      const cp = e.target.closest("[data-copy]");
+      if (cp) copyText(cp.dataset.copy).then((ok) => toast(ok ? "已复制 " + cp.dataset.copy : "复制失败，请手动选中复制"));
+    });
+    $("#ct-body").addEventListener("change", async (e) => {
+      const cb = e.target.closest("input[data-a=autostart]");
+      if (!cb) return;
+      cb.disabled = true;
+      const r = await api("/api/container/autostart", { method: "POST", body: { name: cb.dataset.n, enabled: cb.checked } });
+      cb.disabled = false;
+      if (!r.ok) { cb.checked = !cb.checked; toast(r.error || "保存失败"); return; }
+      toast(cb.checked ? "已开启开机自启" : "已关闭开机自启");
+      lastSig = "";
+    });
+
+    $("#bulk").addEventListener("click", async (e) => {
+      const b = e.target.closest("button[data-bulk]");
+      if (!b) return;
+      const a = b.dataset.bulk, label = b.textContent;
+      if (a === "stop" && !confirm("确认停止所有运行中的容器？")) return;
+      $$("#bulk button").forEach((x) => (x.disabled = true));
+      toast(label + "…");
+      const r = await api("/api/containers/action", { method: "POST", body: { action: a } });
+      $$("#bulk button").forEach((x) => (x.disabled = false));
+      if (r.error) toast(r.error);
+      else if (!r.total) toast("没有需要操作的容器");
+      else if (r.ok) toast(`${label}：完成（${r.total} 个）`);
+      else toast(`${label}：${r.failed.length} 个失败 — ${r.failed.map((f) => f.name + (f.error ? "（" + f.error + "）" : "")).join("、")}`);
+      loadContainers();
+    });
 
     setInterval(() => {
       if (document.hidden || $("#main-view").classList.contains("hidden")) return;
       if (!$("#tab-list").classList.contains("hidden")) loadContainers();
     }, 4000);
 
-    async function onAction(name, action) {
+    async function onAction(name, action, btn) {
       if (action === "destroy" && !confirm(`确认删除容器 ${name}？不可恢复。`)) return;
+      if (btn) btn.disabled = true;
       toast(`${action} ${name}…`);
       const r = await api("/api/container/action", { method: "POST", body: { name, action } });
       if (!r.ok) toast(r.error || r.detail?.stderr || "失败");

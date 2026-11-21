@@ -15,6 +15,7 @@ import struct
 import subprocess
 import termios
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -287,37 +288,184 @@ def container_ips(name: str) -> tuple[list, list]:
     return v4, v6
 
 
-def list_containers() -> list:
-    if not which("lxc-ls"):
-        return []
-    r = run(["lxc-ls", "-f", "-F", "NAME,STATE,AUTOSTART"])
-    if not r["ok"]:
-        return []
+CGROUP_ROOT = Path(os.environ.get("FNLXC_CGROUP", "/sys/fs/cgroup"))
+_CPU_PREV: dict = {}
+_CPU_LOCK = threading.Lock()
+
+
+def _read_int(p: Path):
+    try:
+        v = p.read_text().strip()
+        return None if v == "max" else int(v)
+    except (OSError, ValueError):
+        return None
+
+
+def _host_mem_total() -> int:
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def _cgroup_dir(pid: int, name: str) -> Path | None:
+    """容器 init 的 cgroup v2 目录（取到 lxc.payload.* 这一级）。"""
+    cands = []
+    try:
+        for line in Path(f"/proc/{pid}/cgroup").read_text().splitlines():
+            if line.startswith("0::"):
+                parts = [x for x in line[3:].split("/") if x]
+                for i, part in enumerate(parts):
+                    if part.startswith("lxc.payload"):
+                        cands.append("/".join(parts[: i + 1]))
+                        break
+    except OSError:
+        pass
+    cands.append(f"lxc.payload.{name}")
+    for c in cands:
+        d = CGROUP_ROOT / c
+        if (d / "cpu.stat").exists():
+            return d
+    return None
+
+
+def _net_bytes(pid: int):
+    rx = tx = 0
+    try:
+        for line in Path(f"/proc/{pid}/net/dev").read_text().splitlines()[2:]:
+            iface, _, rest = line.partition(":")
+            if iface.strip() == "lo":
+                continue
+            f = rest.split()
+            rx += int(f[0])
+            tx += int(f[8])
+    except (OSError, ValueError, IndexError):
+        return None, None
+    return rx, tx
+
+
+def _uptime_s(pid: int):
+    try:
+        st = Path(f"/proc/{pid}/stat").read_text()
+        start = int(st.rsplit(")", 1)[1].split()[19]) / os.sysconf("SC_CLK_TCK")
+        up = float(Path("/proc/uptime").read_text().split()[0])
+        return max(0, int(up - start))
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def container_stats(name: str, pid: int, mem_limit_mb: int = 0) -> dict:
+    ncpu = os.cpu_count() or 1
+    st = {"pid": pid, "cpus": f"0-{ncpu - 1}" if ncpu > 1 else "0", "cpu": None,
+          "mem": None, "mem_max": None, "rx": None, "tx": None, "uptime": _uptime_s(pid)}
+    st["rx"], st["tx"] = _net_bytes(pid)
+    d = _cgroup_dir(pid, name)
+    if not d:
+        return st
+    try:
+        eff = (d / "cpuset.cpus.effective").read_text().strip()
+        if eff:
+            st["cpus"] = eff
+    except OSError:
+        pass
+    st["mem"] = _read_int(d / "memory.current")
+    limit = _read_int(d / "memory.max")
+    if not limit and mem_limit_mb:
+        limit = mem_limit_mb * 1024 * 1024
+    st["mem_max"] = limit or _host_mem_total() or None
+    try:
+        usage = next(int(x.split()[1]) for x in (d / "cpu.stat").read_text().splitlines() if x.startswith("usage_usec"))
+    except (OSError, StopIteration, ValueError, IndexError):
+        return st
+    now = time.monotonic()
+    with _CPU_LOCK:
+        prev = _CPU_PREV.get(name)
+        _CPU_PREV[name] = (now, usage)
+    if prev and now > prev[0] and usage >= prev[1]:
+        st["cpu"] = round(min(100.0, (usage - prev[1]) / 1e6 / (now - prev[0]) / ncpu * 100), 1)
+    return st
+
+
+def _lxc_ls_rows() -> list:
+    r = run(["lxc-ls", "-f", "-F", "NAME,STATE,AUTOSTART,PID"])
+    has_pid = r["ok"]
+    if not has_pid:
+        r = run(["lxc-ls", "-f", "-F", "NAME,STATE,AUTOSTART"])
+        if not r["ok"]:
+            return []
     rows = []
     for line in r["stdout"].splitlines()[1:]:
         parts = line.split()
         if len(parts) < 2:
             continue
+        pid = parts[3] if has_pid and len(parts) > 3 else ""
         rows.append(
             {
                 "name": parts[0],
                 "state": parts[1].upper(),
                 "autostart": len(parts) > 2 and parts[2] == "1",
+                "pid": int(pid) if pid.isdigit() else 0,
             }
         )
+    return rows
+
+
+def list_containers() -> list:
+    if not which("lxc-ls"):
+        return []
+    rows = _lxc_ls_rows()
 
     def fill(c):
+        running = c["state"] in ("RUNNING", "FROZEN")
         c["ipv4"], c["ipv6"] = container_ips(c["name"]) if c["state"] == "RUNNING" else ([], [])
         c["distro"], c["release"] = detect_distro(c["name"])
         p = ct_config_path(c["name"])
+        mem_mb = 0
         try:
-            c["webui"] = lxcconf.parse_settings(p.read_text(errors="ignore"))["webui"] if p else ""
+            cs = lxcconf.parse_settings(p.read_text(errors="ignore")) if p else {}
+            c["webui"] = cs.get("webui", "")
+            mem_mb = cs.get("memory_mb", 0)
         except OSError:
             c["webui"] = ""
+        if running and not c["pid"]:
+            r = run(["lxc-info", "-n", c["name"], "-pH"], timeout=10)
+            c["pid"] = int(r["stdout"]) if r["ok"] and r["stdout"].isdigit() else 0
+        c["stats"] = container_stats(c["name"], c["pid"], mem_mb) if running and c["pid"] else None
         return c
 
     with ThreadPoolExecutor(max_workers=8) as ex:
-        return list(ex.map(fill, rows))
+        out = list(ex.map(fill, rows))
+    names = {c["name"] for c in out}
+    with _CPU_LOCK:
+        for k in [k for k in _CPU_PREV if k not in names]:
+            del _CPU_PREV[k]
+    return out
+
+
+def bulk_action(action: str) -> dict:
+    need = {"start": "STOPPED", "stop": "RUNNING", "freeze": "RUNNING", "unfreeze": "FROZEN"}
+    if action not in need:
+        return {"ok": False, "error": "unknown action"}
+    names = [c["name"] for c in _lxc_ls_rows() if c["state"] == need[action]]
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        res = list(ex.map(lambda n: (n, container_action(n, action)), names))
+    failed = [{"name": n, "error": r.get("error", "")} for n, r in res if not r["ok"]]
+    return {"ok": not failed, "total": len(names), "failed": failed}
+
+
+def set_autostart(name: str, enabled: bool) -> dict:
+    name = clean_name(name)
+    p = ct_config_path(name) if name else None
+    if not p:
+        return {"ok": False, "error": "容器不存在"}
+    s = lxcconf.parse_settings(p.read_text(errors="ignore"))
+    if not s["bridge"]:
+        s["bridge"] = load_config().get("bridge") or "br0"
+    s["autostart"] = bool(enabled)
+    return save_container_settings(name, s)
 
 
 def container_state(name: str) -> str:
@@ -995,6 +1143,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/container/create":
             self._json(200, create_container(body))
+            return
+
+        if path == "/api/containers/action":
+            self._json(200, bulk_action(body.get("action", "")))
+            return
+
+        if path == "/api/container/autostart":
+            self._json(200, set_autostart(body.get("name", ""), body.get("enabled")))
             return
 
         if path == "/api/container/action":
