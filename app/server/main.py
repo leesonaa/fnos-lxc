@@ -465,6 +465,8 @@ def list_containers() -> list:
             cs = lxcconf.parse_settings(p.read_text(errors="ignore")) if p else {}
             c["webui"] = cs.get("webui", "")
             mem_mb = cs.get("memory_mb", 0)
+            if p:  # 运行中的容器 lxc-ls 返回的是启动时加载的配置，以磁盘上的 config 为准
+                c["autostart"] = bool(cs.get("autostart"))
         except OSError:
             c["webui"] = ""
         if running and not c["pid"]:

@@ -798,8 +798,11 @@
         </div>`;
     }
 
+    let loadSeq = 0;
     async function loadContainers() {
+      const seq = ++loadSeq;
       const data = await api("/api/containers");
+      if (seq !== loadSeq) return;  // 有更新的请求在途，丢弃这次较旧的结果
       const list = data.containers || [];
       const sig = viewMode + JSON.stringify(list.map(({ stats, ...rest }) => rest));
       containers = list;
@@ -888,6 +891,7 @@
       if (!r.ok) { cb.checked = !cb.checked; toast(r.error || "保存失败"); return; }
       toast(cb.checked ? "已开启开机自启" : "已关闭开机自启");
       lastSig = "";
+      loadContainers();
     });
 
     setInterval(() => {
