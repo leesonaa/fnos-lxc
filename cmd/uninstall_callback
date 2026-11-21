@@ -1,119 +1,153 @@
 #!/bin/bash
-# wizard/uninstall 的 keep_data 开关以 wizard_keep_data 传入
-# 兼容 true/false、1/0、on/off、yes/no（大小写不敏感）
+# 卸载回调：根据向导「保留容器数据」决定是否清除 lxcpath 下全部容器与目录
+# 飞牛注入的字段名通常是 wizard_<field>；同时兼容无前缀、多种真假值写法
 DATA_DIR="${TRIM_PKGVAR:-/vol1/@appdata/fnos-lxc}"
+LOG_FILE="${TRIM_TEMP_LOGFILE:-/tmp/fnos-lxc-uninstall.log}"
 
-log() { echo "[fnos-lxc uninstall] $*" ; }
+log() {
+  local m="[fnos-lxc uninstall] $*"
+  echo "$m"
+  echo "$m" >> "$LOG_FILE" 2>/dev/null || true
+}
 
-# 取初始化时用户选择的容器存储路径（config.json 的 lxcpath），没有则用 lxc 当前配置
 get_lxcpath() {
   local p=""
   if [ -f "${DATA_DIR}/config.json" ] && command -v python3 >/dev/null 2>&1; then
     p="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("lxcpath") or "")' "${DATA_DIR}/config.json" 2>/dev/null)"
   fi
   [ -z "$p" ] && command -v lxc-config >/dev/null 2>&1 && p="$(lxc-config lxc.lxcpath 2>/dev/null)"
-  # 再兜底读 /etc/lxc/lxc.conf
   if [ -z "$p" ] && [ -f /etc/lxc/lxc.conf ]; then
-    p="$(sed -n 's/^[[:space:]]*lxc\.lxcpath[[:space:]]*=[[:space:]]*//p' /etc/lxc/lxc.conf 2>/dev/null | head -1)"
+    p="$(sed -n 's/^[[:space:]]*lxc\.lxcpath[[:space:]]*=[[:space:]]*//p' /etc/lxc/lxc.conf 2>/dev/null | head -1 | tr -d '[:space:]')"
   fi
   echo "${p:-/var/lib/lxc}"
 }
 
-# 与初始化时 check_lxcpath 的规则一致：绝对路径、至少两级、不在系统目录下，绝不删 /vol1、/ 等
 safe_to_remove() {
   local p="${1%/}"
   case "$p" in /*) ;; *) return 1 ;; esac
   case "$p" in *..*|*[[:cntrl:]]*) return 1 ;; esac
   [ "$(echo "$p" | tr -cd / | wc -c)" -ge 2 ] || return 1
   local d
-  for d in /etc /usr /bin /sbin /lib /lib64 /boot /proc /sys /dev /run /root /var /home; do
+  for d in /etc /usr /bin /sbin /lib /lib64 /boot /proc /sys /dev /run /root /var /home /tmp /opt /mnt /media; do
     case "$p" in "$d"|"$d"/*) return 1 ;; esac
   done
+  case "$p" in /vol[0-9]|/vol[0-9][0-9]) return 1 ;; esac
   return 0
 }
 
-# 判断「不要保留数据」：多种假值都算
-keep_raw="${wizard_keep_data:-true}"
-keep_lc="$(printf '%s' "$keep_raw" | tr '[:upper:]' '[:lower:]')"
+keep_raw=""
+for v in wizard_keep_data keep_data WIZARD_KEEP_DATA KEEP_DATA; do
+  eval "val=\${$v-}"
+  if [ -n "$val" ]; then
+    keep_raw="$val"
+    log "found env $v=[$val]"
+    break
+  fi
+done
+[ -z "$keep_raw" ] && keep_raw="${wizard_keep_data:-true}"
+
+keep_lc="$(printf '%s' "$keep_raw" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
 do_purge=0
 case "$keep_lc" in
-  false|0|off|no|n) do_purge=1 ;;
+  false|0|off|no|n|disabled) do_purge=1 ;;
+  true|1|on|yes|y|enabled) do_purge=0 ;;
+  *)
+    log "unknown keep_data value [$keep_raw], treat as keep"
+    do_purge=0
+    ;;
 esac
 
-log "wizard_keep_data=[${keep_raw}] do_purge=${do_purge} DATA_DIR=${DATA_DIR}"
+log "keep_raw=[$keep_raw] keep_lc=[$keep_lc] do_purge=$do_purge DATA_DIR=$DATA_DIR"
+log "env dump: wizard_keep_data=[${wizard_keep_data-}] keep_data=[${keep_data-}] TRIM_PKGVAR=[${TRIM_PKGVAR-}]"
 
-if [ "$do_purge" = "1" ]; then
-  LXCPATH="$(get_lxcpath)"
-  LXCPATH="${LXCPATH%/}"
-  log "LXCPATH=${LXCPATH}"
-
-  # 1) 停止并销毁该存储路径下的全部容器
-  if command -v lxc-ls >/dev/null 2>&1 && [ -d "$LXCPATH" ]; then
-    for n in $(lxc-ls -P "$LXCPATH" -1 2>/dev/null); do
-      log "stop+destroy container: $n"
-      lxc-stop -P "$LXCPATH" -n "$n" -k 2>/dev/null || true
-      # 再等一下，尽量卸掉挂载
-      sleep 1
-      lxc-destroy -P "$LXCPATH" -n "$n" -f -s 2>/dev/null || true
-    done
-  else
-    log "skip container destroy (no lxc-ls or dir missing)"
-  fi
-
-  # 2) 还原初始化时备份的宿主机 LXC 配置
-  for f in lxc.conf default.conf; do
-    if [ -f "${DATA_DIR}/orig/${f}" ]; then
-      log "restore /etc/lxc/${f}"
-      cp -f "${DATA_DIR}/orig/${f}" "/etc/lxc/${f}" 2>/dev/null || true
-    fi
-  done
-
-  # 3) 尽量卸掉残留挂载后再删目录
-  if [ -d "$LXCPATH" ]; then
-    if ! safe_to_remove "$LXCPATH"; then
-      log "skip removing storage dir (unsafe path): $LXCPATH"
-    else
-      # 尝试卸载仍挂在该路径下的挂载点（从深到浅）
-      if command -v findmnt >/dev/null 2>&1; then
-        findmnt -rn -o TARGET | grep -F "${LXCPATH}/" | sort -r | while read -r mnt; do
-          log "umount residual: $mnt"
-          umount -l "$mnt" 2>/dev/null || true
-        done
-      else
-        # 无 findmnt 时用 /proc/mounts
-        awk -v p="${LXCPATH}/" '$2 ~ "^"p {print $2}' /proc/mounts | sort -r | while read -r mnt; do
-          log "umount residual: $mnt"
-          umount -l "$mnt" 2>/dev/null || true
-        done
-      fi
-      sleep 1
-
-      if grep -qs " ${LXCPATH}/" /proc/mounts || grep -qs " ${LXCPATH} " /proc/mounts; then
-        log "skip removing storage dir (still mounted): $LXCPATH"
-        grep " ${LXCPATH}" /proc/mounts || true
-      else
-        for l in /var/lib/lxc /var/cache/lxc; do
-          if [ -L "$l" ]; then
-            t="$(readlink -f "$l" 2>/dev/null)"
-            case "$t" in "$LXCPATH"|"$LXCPATH"/*)
-              log "remove symlink $l -> $t"
-              rm -f "$l"
-              ;;
-            esac
-          fi
-        done
-        log "rm -rf $LXCPATH"
-        rm -rf --one-file-system "$LXCPATH" 2>/dev/null || true
-        [ -d "$LXCPATH" ] && log "warning: failed to fully remove $LXCPATH"
-      fi
-    fi
-  fi
-
-  log "rm -rf DATA_DIR ${DATA_DIR}"
-  rm -rf "${DATA_DIR}" 2>/dev/null || true
-else
+if [ "$do_purge" != "1" ]; then
   log "keep_data enabled, skip purge of containers and storage"
+  echo "fnos-lxc uninstall_callback ok"
+  exit 0
 fi
 
+LXCPATH="$(get_lxcpath)"
+LXCPATH="${LXCPATH%/}"
+log "LXCPATH=$LXCPATH"
+
+if command -v lxc-ls >/dev/null 2>&1; then
+  names=""
+  if [ -d "$LXCPATH" ]; then
+    names="$(lxc-ls -P "$LXCPATH" -1 2>/dev/null)"
+  fi
+  if [ -z "$names" ]; then
+    names="$(lxc-ls -1 2>/dev/null)"
+  fi
+  for n in $names; do
+    [ -z "$n" ] && continue
+    log "stop+destroy: $n"
+    lxc-stop -P "$LXCPATH" -n "$n" -k 2>/dev/null || lxc-stop -n "$n" -k 2>/dev/null || true
+    sleep 1
+    lxc-destroy -P "$LXCPATH" -n "$n" -f -s 2>/dev/null || lxc-destroy -n "$n" -f -s 2>/dev/null || true
+  done
+else
+  log "lxc-ls not found, skip container destroy"
+fi
+
+for f in lxc.conf default.conf; do
+  if [ -f "${DATA_DIR}/orig/${f}" ]; then
+    log "restore /etc/lxc/$f"
+    cp -f "${DATA_DIR}/orig/${f}" "/etc/lxc/${f}" 2>/dev/null || true
+  fi
+done
+
+if [ -d "$LXCPATH" ]; then
+  if ! safe_to_remove "$LXCPATH"; then
+    log "REFUSE removing storage dir (unsafe path): $LXCPATH"
+  else
+    log "umount residual under $LXCPATH"
+    for round in 1 2 3; do
+      if command -v findmnt >/dev/null 2>&1; then
+        findmnt -rn -o TARGET 2>/dev/null | grep -F "$LXCPATH" | sort -r | while read -r mnt; do
+          log "  umount -l $mnt (round $round)"
+          umount -l "$mnt" 2>/dev/null || true
+        done
+      fi
+      awk -v p="$LXCPATH" '$2 == p || index($2, p "/") == 1 {print $2}' /proc/mounts 2>/dev/null | sort -r | while read -r mnt; do
+        log "  umount -l $mnt (round $round)"
+        umount -l "$mnt" 2>/dev/null || true
+      done
+      sleep 1
+    done
+
+    for l in /var/lib/lxc /var/cache/lxc; do
+      if [ -L "$l" ]; then
+        t="$(readlink -f "$l" 2>/dev/null || true)"
+        case "$t" in
+          "$LXCPATH"|"$LXCPATH"/*)
+            log "remove symlink $l -> $t"
+            rm -f "$l"
+            ;;
+        esac
+      fi
+    done
+
+    log "rm -rf $LXCPATH"
+    rm -rf --one-file-system "$LXCPATH" 2>/dev/null || true
+    if [ -d "$LXCPATH" ]; then
+      log "one-file-system rm incomplete, try plain rm -rf"
+      rm -rf "$LXCPATH" 2>/dev/null || true
+    fi
+    if [ -d "$LXCPATH" ]; then
+      log "WARNING: failed to fully remove $LXCPATH"
+      ls -la "$LXCPATH" 2>/dev/null | head -20 >> "$LOG_FILE" 2>/dev/null || true
+      grep "$LXCPATH" /proc/mounts >> "$LOG_FILE" 2>/dev/null || true
+    else
+      log "storage dir removed OK"
+    fi
+  fi
+else
+  log "LXCPATH not a directory, nothing to rm: $LXCPATH"
+fi
+
+log "rm -rf DATA_DIR $DATA_DIR"
+rm -rf "${DATA_DIR}" 2>/dev/null || true
+
 echo "fnos-lxc uninstall_callback ok"
+log "done"
 exit 0

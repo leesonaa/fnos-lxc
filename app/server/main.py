@@ -718,18 +718,21 @@ def _snap_err(r: dict) -> str:
         parts.append(f"exit={code}")
     body = (r.get("stderr") or r.get("stdout") or "").strip()
     if body:
-        # 取最后几行，避免刷屏
         lines = [ln for ln in body.splitlines() if ln.strip()]
         parts.append("\n".join(lines[-6:]) if lines else body)
     return " | ".join(parts) if parts else "失败"
 
 
 def _snapshot_worker(job: dict, name: str, op: str, snap: str, comment: str, freeze: bool, as_new: str) -> None:
+    """dir 后端的 lxc-snapshot 是 copy-clone，不支持运行中容器。
+    --allowrunning 只存在于 lxc-copy，lxc-snapshot 不认该参数。
+    因此创建时若容器在跑：先停止 → 快照 → 再启动（兼容运行中一键创建）。
+    """
     tmp = None
-    frozen = False
+    was_running = False
+    stopped_by_us = False
     try:
         if op in ("create", "restore"):
-            # dir 后端是整份复制：明显放不下就先拒绝（btrfs/zfs 写时复制不检查）
             cp = ct_config_path(name)
             if cp and _fstype(cp.parent) not in ("btrfs", "zfs"):
                 _job_set(job, stage="检查磁盘空间", progress=3)
@@ -738,7 +741,24 @@ def _snapshot_worker(job: dict, name: str, op: str, snap: str, comment: str, fre
                     _job_set(job, status="error", error=f"磁盘空间不足：容器约 {need >> 20} MB，剩余 {free >> 20} MB")
                     return
         if op == "create":
-            _job_set(job, stage="创建快照", progress=10)
+            state = _container_state(name)
+            # lxc-snapshot 无法对 RUNNING/FROZEN 做 dir 快照，必须先停
+            if state in ("RUNNING", "FROZEN"):
+                was_running = True
+                _job_set(job, stage="停止容器以创建快照", progress=8)
+                if state == "FROZEN":
+                    run(["lxc-unfreeze", "-n", name], timeout=30)
+                t = str(int(load_config().get("timeout", 15)))
+                r_stop = run(["lxc-stop", "-n", name, "-t", t], timeout=max(60, int(t) + 30))
+                if not r_stop["ok"]:
+                    r_stop = run(["lxc-stop", "-n", name, "-k"], timeout=30)
+                st2 = _container_state(name)
+                if st2 not in ("STOPPED", ""):
+                    _job_set(job, status="error", error=f"无法停止容器（状态 {st2}），dir 存储下必须停止后才能创建快照。{_snap_err(r_stop)}")
+                    return
+                stopped_by_us = True
+
+            _job_set(job, stage="创建快照", progress=20)
             argv = ["lxc-snapshot", "-n", name]
             if comment:
                 import tempfile
@@ -746,27 +766,22 @@ def _snapshot_worker(job: dict, name: str, op: str, snap: str, comment: str, fre
                 with os.fdopen(fd, "w") as f:
                     f.write(comment)
                 argv += ["-c", tmp]
-            state = _container_state(name)
-            # dir 后端实际是 copy-clone：RUNNING/FROZEN 必须加 --allowrunning，否则静默失败
-            if state in ("RUNNING", "FROZEN"):
-                if freeze and state == "RUNNING":
-                    if run(["lxc-freeze", "-n", name], timeout=30)["ok"]:
-                        frozen = True
-                argv.append("--allowrunning")
             r = run(argv, timeout=3600)
-            # 极老版本可能不认 --allowrunning：去掉后再试一次（仅当明确是 unrecognized 类错误）
-            if not r["ok"] and "--allowrunning" in argv:
-                err_l = (r.get("stderr") or r.get("stdout") or "").lower()
-                if "unrecognized" in err_l or "unknown option" in err_l or "invalid option" in err_l:
-                    argv2 = [a for a in argv if a != "--allowrunning"]
-                    r = run(argv2, timeout=3600)
-                    if not r["ok"]:
-                        # 仍然失败：提示用户先停止
-                        msg = _snap_err(r)
-                        if state in ("RUNNING", "FROZEN"):
-                            msg = f"运行中快照失败（当前状态 {state}）。请先停止容器再试。原始错误: {msg}"
-                        _job_set(job, status="error", error=msg[:500])
-                        return
+
+            if r["ok"] and stopped_by_us and was_running:
+                _job_set(job, stage="重新启动容器", progress=90)
+                run(["lxc-start", "-n", name, "-d"], timeout=120)
+                stopped_by_us = False
+
+            if r["ok"]:
+                _job_set(job, status="done", progress=100, stage="完成")
+            else:
+                msg = _snap_err(r)
+                if was_running:
+                    msg = f"快照失败。详情: {msg}"
+                _job_set(job, status="error", error=msg[:500])
+            return
+
         elif op == "restore":
             _job_set(job, stage="回滚快照" if not as_new else "从快照克隆", progress=10)
             argv = ["lxc-snapshot", "-n", name, "-r", snap] + (["-N", as_new] if as_new else [])
@@ -777,22 +792,16 @@ def _snapshot_worker(job: dict, name: str, op: str, snap: str, comment: str, fre
         if r["ok"]:
             _job_set(job, status="done", progress=100, stage="完成")
         else:
-            msg = _snap_err(r)
-            # 运行中仍失败时给用户可操作的提示
-            if op == "create":
-                st = _container_state(name)
-                low = msg.lower()
-                if st in ("RUNNING", "FROZEN") or "running" in low or "allowrunning" in low:
-                    msg = f"快照失败（容器可能仍在运行）。建议先停止容器再创建。详情: {msg}"
-            _job_set(job, status="error", error=msg[:500])
+            _job_set(job, status="error", error=_snap_err(r)[:500])
     finally:
-        if frozen:
-            run(["lxc-unfreeze", "-n", name], timeout=30)
+        if stopped_by_us and was_running:
+            run(["lxc-start", "-n", name, "-d"], timeout=120)
         if tmp:
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
+
 
 
 def snapshot_op(name: str, body: dict) -> dict:
