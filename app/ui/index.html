@@ -255,11 +255,12 @@
     .ct-row .mut { color: var(--muted); }
     .ct-row .ips { display: flex; flex-direction: column; min-width: 0; }
     .pb { position: relative; flex: 1; height: 20px; border-radius: 4px; background: var(--pbar-bg); overflow: hidden; }
-    .pb > i { font-style: normal; display: block; height: 100%; min-width: 44px; border-radius: 4px; background: var(--blue); transition: width .4s; }
+    .pb > i { font-style: normal; display: block; height: 100%; min-width: 2px; border-radius: 4px; background: var(--blue); transition: width .4s; }
     .pb > i.mid { background: var(--orange); }
     .pb > i.hi { background: var(--red); }
-    .pb > i > b { position: absolute; left: 8px; top: 0; line-height: 20px; font-size: 11px; font-weight: 600; color: #fff; }
-    html:not([data-theme="light"]) .pb > i > b { color: #06121f; }
+    .pb > b { position: absolute; left: 8px; top: 0; line-height: 20px; font-size: 11px; font-weight: 600; color: #fff; }
+    html:not([data-theme="light"]) .pb > b { color: #06121f; }
+    .pb > b.out, html:not([data-theme="light"]) .pb > b.out { color: var(--text); }
     .pb > em { position: absolute; right: 8px; top: 0; line-height: 20px; font-style: normal; font-size: 11px; color: var(--muted); }
     .ct-foot { display: flex; gap: 6px; flex-wrap: wrap; border-top: 1px solid var(--border); padding-top: 12px; }
     .ct-foot button { padding: 5px 12px; }
@@ -760,7 +761,9 @@
       if (v == null) return `<div class="pb"><em>-</em></div>${tail}`;
       v = Math.max(0, Math.min(100, v));
       const cls = v >= 85 ? "hi" : v >= 60 ? "mid" : "";
-      return `<div class="pb"><i class="${cls}" style="width:${v.toFixed(1)}%"><b>${text}</b></i></div>${tail}`;
+      // 条太短放不下文字时，把百分比放到条的右侧
+      const out = v < 30;
+      return `<div class="pb"><i class="${cls}" style="width:${v.toFixed(1)}%"></i><b class="${out ? "out" : ""}" ${out ? `style="left:calc(${v.toFixed(1)}% + 6px)"` : ""}>${text}</b></div>${tail}`;
     }
     const rateText = (n) => (n == null ? "-" : fmtBytes(n) + "/s");
     function cardRows(c) {
