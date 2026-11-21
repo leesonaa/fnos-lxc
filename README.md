@@ -29,6 +29,12 @@ IPv4 设为静态时，会同时关闭容器内 **eth0** 的 DHCP（ifupdown / s
 容器运行时点「终端」：真正的交互式终端（xterm.js + PTY + WebSocket，经 `lxc-attach`），
 直接在黑框里敲命令（优先 `nsenter` 进入容器命名空间，不可用时回退 `lxc-attach`），支持 Tab 补全、Ctrl+C、vim/top 等。优先 bash，没有则 sh。
 
+## 快照
+
+「更多 ▾ → 快照」：创建（可写备注，运行中可先冻结）、回滚（需先停止容器）、克隆为新容器、删除。
+基于 `lxc-snapshot`；dir 存储每个快照是完整副本，创建前会检查磁盘剩余空间（btrfs/zfs 跳过）。
+删除容器时会同时删除其快照（`lxc-destroy -s`）。
+
 ## 打包
 
 在已安装 `fnpack` 的机器上：
@@ -77,7 +83,7 @@ appcenter-cli start fnos-lxc
 
 - 初始化与容器操作需要 **root**（privilege 已声明）
 - 创建容器首次会从 `images.linuxcontainers.org` 拉模板，需能访问外网
-- 快照页可在后续版本加；当前已覆盖：列表 / 启停杀冻 / 创建 / 配置表单 / 终端
+- 已覆盖：列表 / 启停杀冻 / 创建 / 配置表单 / 终端 / 快照
 - **访问方式**：通过飞牛[统一网关](https://developer.fnnas.com/docs/core-concepts/gateway-registration)（`/app/fnos-lxc/`）打开，由飞牛校验登录，应用只放行管理员（`X-Trim-Isadmin`）；因此经飞牛反代、穿透访问都可用。不再开放 9100 或任何 TCP 端口，无法绕过飞牛登录直连（IPv4 / IPv6 都一样）
 - 所有写操作需带自定义请求头（防跨站请求），终端 WebSocket 使用一次性 30 秒令牌
 - Unix Socket 权限为 0666（网关进程需要连接），本机其他有 shell 的用户理论上可伪造网关头，请只给可信用户 SSH 权限

@@ -112,3 +112,27 @@ class ContainerFileTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SnapshotTests(unittest.TestCase):
+    def test_parse(self):
+        out = ("snap1 (/vol1/lxc/web/snaps) 2026:11:22 10:05:00\n"
+               "snap0 (/vol1/lxc/web/snaps) 2026:11:21 09:00:01\n"
+               "garbage line\n")
+        r = main.parse_snapshots(out)
+        self.assertEqual([x["name"] for x in r], ["snap0", "snap1"])
+        self.assertEqual(r[0]["time"], "2026-11-21 09:00:01")
+        self.assertEqual(r[0]["path"], "/vol1/lxc/web/snaps")
+        self.assertEqual(main.parse_snapshots("No snapshots"), [])
+
+    def test_validation(self):
+        base = Path(tempfile.mkdtemp())
+        d = base / "t1"
+        d.mkdir()
+        (d / "config").write_text("lxc.rootfs.path = dir:/x\n")
+        main.save_config({**main.load_config(), "lxcpath": str(base)})
+        self.assertFalse(main.snapshot_op("t1", {"op": "bogus"})["ok"])
+        self.assertFalse(main.snapshot_op("t1", {"op": "delete", "snap": "snap0"})["ok"])  # 缺 confirm
+        self.assertFalse(main.snapshot_op("t1", {"op": "delete", "snap": "../x", "confirm": True})["ok"])
+        self.assertFalse(main.snapshot_op("t1", {"op": "restore", "snap": "snap0", "confirm": True, "as_new": "a b"})["ok"])
+        self.assertFalse(main.snapshot_op("nope", {"op": "create"})["ok"])

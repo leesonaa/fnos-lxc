@@ -183,6 +183,11 @@
       border-radius: 12px; padding: 22px; width: min(480px, 92vw);
     }
     .modal h2 { margin: 0 0 14px; font-size: 16px; }
+    .snap-table { width: 100%; border-collapse: collapse; font-size: 13px; margin: 6px 0 12px; }
+    .snap-table th { text-align: left; color: var(--muted); font-weight: 500; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+    .snap-table td { padding: 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    .snap-table td:last-child { text-align: right; white-space: nowrap; }
+    .snap-table td:last-child button { margin-left: 4px; }
     .toast {
       position: fixed; right: 16px; bottom: 16px; background: var(--toast-bg);
       -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
@@ -558,6 +563,25 @@
     </div>
   </div>
 
+  <!-- Snapshot modal -->
+  <div class="modal-bg hidden" id="modal-snap">
+    <div class="modal wide">
+      <h2 id="snap-title">快照</h2>
+      <div class="body">
+        <div class="row" style="margin-bottom:10px">
+          <input type="text" id="snap-comment" placeholder="备注（可选）" maxlength="200" style="flex:1;min-width:0">
+          <button class="primary" id="snap-create">创建快照</button>
+        </div>
+        <label class="check" style="margin-bottom:8px"><input type="checkbox" id="snap-freeze" checked><span>运行中创建时先冻结<small>保证文件一致；数据库类容器更建议先停止再创建</small></span></label>
+        <div class="hint hidden" id="snap-busy"></div>
+        <table class="snap-table"><thead><tr><th>名称</th><th>时间</th><th>备注</th><th></th></tr></thead><tbody id="snap-rows"></tbody></table>
+        <div class="empty hidden" id="snap-empty">还没有快照</div>
+        <div class="hint">回滚会用快照覆盖当前容器，需先停止容器；「克隆」则把快照复制成一个新容器，不影响原容器。dir 存储每个快照都是完整副本，会占用相应磁盘空间。</div>
+      </div>
+      <div class="row" style="margin-top:12px"><div class="spacer"></div><button id="snap-close">关闭</button></div>
+    </div>
+  </div>
+
   <!-- Terminal modal -->
   <div class="modal-bg hidden" id="modal-term">
     <div class="modal term">
@@ -867,6 +891,7 @@
       const items = [];
       if (st === "RUNNING") items.push(["kill", "强制停止"], ["freeze", "冻结"]);
       else if (st === "FROZEN") items.push(["kill", "强制停止"]);
+      items.push(["snap", "快照"]);
       items.push(["destroy", "删除", "danger"]);
       menu.innerHTML = items.map(([a, t, cls]) => `<button data-a="${a}" class="${cls || ""}">${t}</button>`).join("");
       menu.classList.remove("hidden");
@@ -878,7 +903,7 @@
         const b = e.target.closest("button[data-a]");
         if (!b) return;
         closeMenu();
-        onAction(n, b.dataset.a);
+        if (b.dataset.a === "snap") openSnap(n); else onAction(n, b.dataset.a);
       };
     }
     document.addEventListener("click", (e) => {
@@ -918,8 +943,74 @@
       if (!$("#tab-list").classList.contains("hidden")) loadContainers();
     }, 4000);
 
+
+    // ---------- 快照 ----------
+    let snapCt = "", snapBusy = false;
+    const escH = (t) => String(t ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    function snapSetBusy(msg) {
+      snapBusy = !!msg;
+      const b = $("#snap-busy");
+      b.textContent = msg || "";
+      b.classList.toggle("hidden", !msg);
+      $$("#modal-snap button").forEach((x) => { if (x.id !== "snap-close") x.disabled = snapBusy; });
+    }
+    async function loadSnaps() {
+      const r = await api(`/api/container/${encodeURIComponent(snapCt)}/snapshots`);
+      const rows = $("#snap-rows");
+      if (!r.ok) { rows.innerHTML = ""; $("#snap-empty").textContent = r.error || "读取失败"; $("#snap-empty").classList.remove("hidden"); return; }
+      $("#snap-empty").textContent = "还没有快照";
+      $("#snap-empty").classList.toggle("hidden", r.snapshots.length > 0);
+      rows.innerHTML = r.snapshots.slice().reverse().map((x) =>
+        `<tr><td>${escH(x.name)}</td><td>${escH(x.time)}</td><td>${escH(x.comment)}</td><td>` +
+        `<button data-s="restore" data-n="${escH(x.name)}">回滚</button>` +
+        `<button data-s="clone" data-n="${escH(x.name)}">克隆</button>` +
+        `<button data-s="delete" data-n="${escH(x.name)}" class="danger">删除</button></td></tr>`).join("");
+    }
+    async function snapRun(body, label) {
+      snapSetBusy(label + "…");
+      const r = await api(`/api/container/${encodeURIComponent(snapCt)}/snapshot`, { method: "POST", body });
+      if (!r.ok) { snapSetBusy(""); toast(r.error || "失败"); return; }
+      for (;;) {
+        await new Promise((x) => setTimeout(x, 1000));
+        const j = await api(`/api/job/${r.job}`);
+        if (!j.ok) { snapSetBusy(""); toast(j.error || "任务丢失"); return; }
+        if (j.status === "running") { snapSetBusy(j.stage + "…"); continue; }
+        snapSetBusy("");
+        toast(j.status === "done" ? "完成" : (j.error || "失败"));
+        break;
+      }
+      await loadSnaps();
+      lastSig = "";
+      loadContainers();
+    }
+    async function openSnap(name) {
+      snapCt = name;
+      $("#snap-title").textContent = `快照 · ${name}`;
+      $("#snap-comment").value = "";
+      snapSetBusy("");
+      $("#modal-snap").classList.remove("hidden");
+      await loadSnaps();
+    }
+    $("#snap-close").onclick = () => $("#modal-snap").classList.add("hidden");
+    $("#snap-create").onclick = () =>
+      snapRun({ op: "create", comment: $("#snap-comment").value, freeze: $("#snap-freeze").checked }, "正在创建快照").then(() => { $("#snap-comment").value = ""; });
+    $("#snap-rows").addEventListener("click", (e) => {
+      const b = e.target.closest("button[data-s]");
+      if (!b || snapBusy) return;
+      const snap = b.dataset.n, act = b.dataset.s;
+      if (act === "delete") {
+        if (confirm(`确认删除快照 ${snap}？`)) snapRun({ op: "delete", snap, confirm: true }, "正在删除快照");
+      } else if (act === "restore") {
+        if (confirm(`确认把 ${snapCt} 回滚到 ${snap}？当前状态会被覆盖，此操作不可恢复。`))
+          snapRun({ op: "restore", snap, confirm: true }, "正在回滚");
+      } else {
+        const nn = prompt(`把 ${snap} 克隆为新容器，请输入新容器名称：`, `${snapCt}-copy`);
+        if (nn) snapRun({ op: "restore", snap, as_new: nn.trim(), confirm: true }, "正在克隆");
+      }
+    });
+
     async function onAction(name, action, btn) {
-      if (action === "destroy" && !confirm(`确认删除容器 ${name}？此操作不可恢复。`)) return;
+      if (action === "destroy" && !confirm(`确认删除容器 ${name}？其所有快照也会一并删除，此操作不可恢复。`)) return;
       if (btn) btn.disabled = true;
       toast(`${action} ${name}…`);
       const body = { name, action };

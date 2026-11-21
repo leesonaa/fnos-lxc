@@ -637,7 +637,7 @@ def container_action(name: str, action: str, confirm: bool = False) -> dict:
         "kill": ["lxc-stop", "-n", name, "-k"],
         "freeze": ["lxc-freeze", "-n", name],
         "unfreeze": ["lxc-unfreeze", "-n", name],
-        "destroy": ["lxc-destroy", "-n", name, "-f"],
+        "destroy": ["lxc-destroy", "-n", name, "-f", "-s"],
     }
     if action not in mapping:
         return {"ok": False, "error": "unknown action"}
@@ -648,6 +648,158 @@ def container_action(name: str, action: str, confirm: bool = False) -> dict:
     r = run(mapping[action], timeout=180)
     err = r["stderr"].splitlines()[-1] if r["stderr"] else ""
     return {"ok": r["ok"], "error": "" if r["ok"] else err, "detail": r}
+
+
+# ----- 快照 -----
+
+_SNAP_RE = re.compile(r"^snap\d+$")
+_SNAP_LINE = re.compile(r"^(snap\d+)\s+\((.*?)\)\s+(\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2})\s*$")
+
+
+def parse_snapshots(text: str) -> list:
+    """解析 `lxc-snapshot -L` 输出：snapN (路径) 2026:11:22 10:00:00"""
+    out = []
+    for ln in (text or "").splitlines():
+        m = _SNAP_LINE.match(ln.strip())
+        if m:
+            out.append({"name": m.group(1), "path": m.group(2), "time": m.group(3).replace(":", "-", 2)})
+    out.sort(key=lambda x: int(x["name"][4:]))
+    return out
+
+
+def _snap_comment(path: str, snap: str) -> str:
+    for d in (Path(path) / snap, Path(path) / snap / "snap"):
+        try:
+            return (d / "comment").read_text(errors="ignore").strip()[:200]
+        except OSError:
+            continue
+    return ""
+
+
+def list_snapshots(name: str) -> dict:
+    name = clean_name(name)
+    if not name or not ct_config_path(name):
+        return {"ok": False, "error": "容器不存在"}
+    r = run(["lxc-snapshot", "-n", name, "-L"], timeout=30)
+    if not r["ok"] and "No snapshots" not in r["stderr"]:
+        return {"ok": False, "error": r["stderr"].splitlines()[-1] if r["stderr"] else "lxc-snapshot 失败"}
+    snaps = parse_snapshots(r["stdout"])
+    for sn in snaps:
+        sn["comment"] = _snap_comment(sn["path"], sn["name"])
+    return {"ok": True, "snapshots": snaps}
+
+
+def _container_state(name: str) -> str:
+    r = run(["lxc-info", "-n", name, "-sH"], timeout=10)
+    return r["stdout"].strip().upper() if r["ok"] else ""
+
+
+def _free_bytes(path: Path) -> int:
+    try:
+        st = os.statvfs(path)
+        return st.f_bavail * st.f_frsize
+    except OSError:
+        return 0
+
+
+def _dir_bytes(path: Path) -> int:
+    r = run(["du", "-sb", str(path)], timeout=120)
+    try:
+        return int(r["stdout"].split()[0])
+    except (ValueError, IndexError):
+        return 0
+
+
+def _snapshot_worker(job: dict, name: str, op: str, snap: str, comment: str, freeze: bool, as_new: str) -> None:
+    tmp = None
+    frozen = False
+    try:
+        if op in ("create", "restore"):
+            # dir 后端是整份复制：明显放不下就先拒绝（btrfs/zfs 写时复制不检查）
+            cp = ct_config_path(name)
+            if cp and _fstype(cp.parent) not in ("btrfs", "zfs"):
+                _job_set(job, stage="检查磁盘空间", progress=3)
+                need, free = _dir_bytes(cp.parent / "rootfs"), _free_bytes(cp.parent)
+                if need and free and need > free:
+                    _job_set(job, status="error", error=f"磁盘空间不足：容器约 {need >> 20} MB，剩余 {free >> 20} MB")
+                    return
+        if op == "create":
+            _job_set(job, stage="创建快照", progress=10)
+            argv = ["lxc-snapshot", "-n", name]
+            if comment:
+                import tempfile
+                fd, tmp = tempfile.mkstemp(prefix="fnlxc-snap-")
+                with os.fdopen(fd, "w") as f:
+                    f.write(comment)
+                argv += ["-c", tmp]
+            if freeze and _container_state(name) == "RUNNING":
+                if run(["lxc-freeze", "-n", name], timeout=30)["ok"]:
+                    frozen = True
+            r = run(argv, timeout=3600)
+        elif op == "restore":
+            _job_set(job, stage="回滚快照" if not as_new else "从快照克隆", progress=10)
+            argv = ["lxc-snapshot", "-n", name, "-r", snap] + (["-N", as_new] if as_new else [])
+            r = run(argv, timeout=3600)
+        else:  # delete
+            _job_set(job, stage="删除快照", progress=10)
+            r = run(["lxc-snapshot", "-n", name, "-d", snap], timeout=600)
+        if r["ok"]:
+            _job_set(job, status="done", progress=100, stage="完成")
+        else:
+            err = r["stderr"].splitlines()[-1] if r["stderr"] else "失败"
+            _job_set(job, status="error", error=err)
+    finally:
+        if frozen:
+            run(["lxc-unfreeze", "-n", name], timeout=30)
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def snapshot_op(name: str, body: dict) -> dict:
+    name = clean_name(name)
+    if not name or not ct_config_path(name):
+        return {"ok": False, "error": "容器不存在"}
+    op = body.get("op")
+    snap = str(body.get("snap") or "")
+    comment = str(body.get("comment") or "").strip()[:200]
+    comment = "".join(c for c in comment if c.isprintable())
+    as_new = ""
+    if op not in ("create", "restore", "delete"):
+        return {"ok": False, "error": "unknown op"}
+    if op in ("restore", "delete"):
+        if not _SNAP_RE.match(snap):
+            return {"ok": False, "error": "快照名无效"}
+        if not body.get("confirm"):
+            return {"ok": False, "error": "该操作需要 confirm=true 二次确认"}
+    if op == "restore":
+        as_new = clean_name(str(body.get("as_new") or "")) if body.get("as_new") else ""
+        if body.get("as_new") and not as_new:
+            return {"ok": False, "error": "新容器名称无效"}
+        if as_new and ct_config_path(as_new):
+            return {"ok": False, "error": "新容器名称已存在"}
+        if not as_new and _container_state(name) not in ("STOPPED", ""):
+            return {"ok": False, "error": "回滚前请先停止容器"}
+    with _JOBS_LOCK:
+        if any(j["name"] == name and j["status"] == "running" for j in _JOBS.values()):
+            return {"ok": False, "error": "该容器正有任务在执行"}
+        jid = f"{int(time.time() * 1000)}"
+        job = {"id": jid, "name": name, "status": "running", "progress": 1, "stage": "开始",
+               "log": [], "elapsed": 0, "downloaded": 0, "total": 0, "error": ""}
+        _JOBS[jid] = job
+    threading.Thread(
+        target=_snapshot_worker,
+        args=(job, name, op, snap, comment, bool(body.get("freeze", True)), as_new),
+        daemon=True,
+    ).start()
+    return {"ok": True, "job": jid}
+
+
+def _fstype(path: Path) -> str:
+    r = run(["stat", "-f", "-c", "%T", str(path)], timeout=5)
+    return r["stdout"].strip() if r["ok"] else ""
 
 
 def host_arch() -> str:
@@ -1416,6 +1568,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, get_job(m.group(1)))
             return
 
+        m = re.match(r"^/api/container/([^/]+)/snapshots$", path)
+        if m:
+            self._json(200, list_snapshots(m.group(1)))
+            return
+
         m = re.match(r"^/api/container/([^/]+)/(settings|config)$", path)
         if m:
             name, what = m.groups()
@@ -1452,6 +1609,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/container/autostart":
             self._json(200, set_autostart(body.get("name", ""), body.get("enabled")))
+            return
+
+        m = re.match(r"^/api/container/([^/]+)/snapshot$", path)
+        if m:
+            self._json(200, snapshot_op(m.group(1), body))
             return
 
         if path == "/api/container/action":
