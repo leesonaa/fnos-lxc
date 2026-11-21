@@ -572,11 +572,11 @@
           <input type="text" id="snap-comment" placeholder="备注（可选）" maxlength="200" style="flex:1;min-width:0">
           <button class="primary" id="snap-create">创建快照</button>
         </div>
-        <label class="check" style="margin-bottom:8px"><input type="checkbox" id="snap-freeze" checked><span>运行中创建时先冻结<small>保证文件一致；数据库类容器更建议先停止再创建</small></span></label>
+        <label class="check" style="margin-bottom:8px"><input type="checkbox" id="snap-freeze" checked><span>运行中创建时会先停止<small>保证文件一致；数据库类容器更建议先停止再创建</small></span></label>
         <div class="hint hidden" id="snap-busy"></div>
         <table class="snap-table"><thead><tr><th>名称</th><th>时间</th><th>备注</th><th></th></tr></thead><tbody id="snap-rows"></tbody></table>
         <div class="empty hidden" id="snap-empty">还没有快照</div>
-        <div class="hint">dir 存储下快照是完整副本，会占用相应磁盘空间。运行中创建会自动先停止再快照并恢复运行；数据库类容器建议业务低峰操作。回滚需先停止容器；「克隆」把快照复制成新容器，不影响原容器。</div>
+        <div class="hint">dir 存储下快照是完整副本，会占用相应磁盘空间。运行中创建/回滚会自动先停止再操作并恢复运行；数据库类容器建议业务低峰操作。「克隆」把快照复制成新容器，不影响原容器。</div>
       </div>
       <div class="row" style="margin-top:12px"><div class="spacer"></div><button id="snap-close">关闭</button></div>
     </div>

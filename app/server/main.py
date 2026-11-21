@@ -726,7 +726,7 @@ def _snap_err(r: dict) -> str:
 def _snapshot_worker(job: dict, name: str, op: str, snap: str, comment: str, freeze: bool, as_new: str) -> None:
     """dir 后端的 lxc-snapshot 是 copy-clone，不支持运行中容器。
     --allowrunning 只存在于 lxc-copy，lxc-snapshot 不认该参数。
-    因此创建时若容器在跑：先停止 → 快照 → 再启动（兼容运行中一键创建）。
+    因此创建/原地回滚时若容器在跑：先停止 → 操作 → 再启动（兼容运行中一键操作）。
     """
     tmp = None
     was_running = False
@@ -783,9 +783,30 @@ def _snapshot_worker(job: dict, name: str, op: str, snap: str, comment: str, fre
             return
 
         elif op == "restore":
-            _job_set(job, stage="回滚快照" if not as_new else "从快照克隆", progress=10)
+            # 原地回滚需要容器停止；克隆为新容器不要求停原容器
+            if not as_new:
+                state = _container_state(name)
+                if state in ("RUNNING", "FROZEN"):
+                    was_running = True
+                    _job_set(job, stage="停止容器以回滚", progress=8)
+                    if state == "FROZEN":
+                        run(["lxc-unfreeze", "-n", name], timeout=30)
+                    t = str(int(load_config().get("timeout", 15)))
+                    r_stop = run(["lxc-stop", "-n", name, "-t", t], timeout=max(60, int(t) + 30))
+                    if not r_stop["ok"]:
+                        r_stop = run(["lxc-stop", "-n", name, "-k"], timeout=30)
+                    st2 = _container_state(name)
+                    if st2 not in ("STOPPED", ""):
+                        _job_set(job, status="error", error=f"无法停止容器（状态 {st2}），回滚前必须停止。{_snap_err(r_stop)}")
+                        return
+                    stopped_by_us = True
+            _job_set(job, stage="回滚快照" if not as_new else "从快照克隆", progress=20)
             argv = ["lxc-snapshot", "-n", name, "-r", snap] + (["-N", as_new] if as_new else [])
             r = run(argv, timeout=3600)
+            if r["ok"] and stopped_by_us and was_running and not as_new:
+                _job_set(job, stage="重新启动容器", progress=90)
+                run(["lxc-start", "-n", name, "-d"], timeout=120)
+                stopped_by_us = False
         else:  # delete
             _job_set(job, stage="删除快照", progress=10)
             r = run(["lxc-snapshot", "-n", name, "-d", snap], timeout=600)
@@ -826,8 +847,7 @@ def snapshot_op(name: str, body: dict) -> dict:
             return {"ok": False, "error": "新容器名称无效"}
         if as_new and ct_config_path(as_new):
             return {"ok": False, "error": "新容器名称已存在"}
-        if not as_new and _container_state(name) not in ("STOPPED", ""):
-            return {"ok": False, "error": "回滚前请先停止容器"}
+        # 原地回滚若容器在跑，由 worker 内自动停止→回滚→再启动
     with _JOBS_LOCK:
         if any(j["name"] == name and j["status"] == "running" for j in _JOBS.values()):
             return {"ok": False, "error": "该容器正有任务在执行"}
