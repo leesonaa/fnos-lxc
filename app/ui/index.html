@@ -157,7 +157,7 @@
     .distro { color: var(--muted); font-size: 12px; white-space: nowrap; }
     .ip { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; cursor: pointer; word-break: break-all; }
     .ip6 { font-size: 11px; max-width: 300px; }
-    .ct-addr .ip6 { max-width: none; }
+    .ct-row .ip6 { max-width: none; }
     .steps { display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; }
     .step-pill {
       padding: 6px 12px; border-radius: 999px; border: 1px solid var(--border);
@@ -241,14 +241,26 @@
     .switch input:checked + span { background: #2563eb; }
     .switch input:checked + span::after { transform: translateX(16px); }
     .switch input:disabled + span { opacity: .5; }
-    .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 16px; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; }
     .ct-card { background: var(--panel); -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; box-shadow: 0 8px 28px rgba(0,0,0,.12); display: flex; flex-direction: column; gap: 14px; }
     .ct-head { display: flex; align-items: center; gap: 12px; }
     .ct-head .ct-title { flex: 1; min-width: 0; }
     .ct-head strong { font-size: 15px; }
-    .ct-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
-    .ct-stats > div > label { margin: 0 0 2px; }
-    .ct-addr { min-height: 18px; }
+    .ct-rows { display: flex; flex-direction: column; gap: 7px; }
+    .ct-row { display: flex; align-items: center; gap: 12px; min-height: 22px; font-size: 13px; font-variant-numeric: tabular-nums; }
+    .ct-row > label { width: 34px; margin: 0; flex: none; color: var(--muted); font-size: 12px; }
+    .ct-row > span { white-space: nowrap; }
+    .ct-row > .pb { min-width: 60px; }
+    .ct-row > .pb + .mut { min-width: 92px; text-align: right; }
+    .ct-row .mut { color: var(--muted); }
+    .ct-row .ips { display: flex; flex-direction: column; min-width: 0; }
+    .pb { position: relative; flex: 1; height: 20px; border-radius: 4px; background: var(--pbar-bg); overflow: hidden; }
+    .pb > i { font-style: normal; display: block; height: 100%; min-width: 44px; border-radius: 4px; background: var(--blue); transition: width .4s; }
+    .pb > i.mid { background: var(--orange); }
+    .pb > i.hi { background: var(--red); }
+    .pb > i > b { position: absolute; left: 8px; top: 0; line-height: 20px; font-size: 11px; font-weight: 600; color: #fff; }
+    html:not([data-theme="light"]) .pb > i > b { color: #06121f; }
+    .pb > em { position: absolute; right: 8px; top: 0; line-height: 20px; font-style: normal; font-size: 11px; color: var(--muted); }
     .ct-foot { display: flex; gap: 6px; flex-wrap: wrap; border-top: 1px solid var(--border); padding-top: 12px; }
     .ct-foot button { padding: 5px 12px; }
     .view-toggle { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
@@ -701,7 +713,7 @@
     const statNet = (c) => c.stats && c.stats.rx != null
       ? `<span class="kv"><i>↓</i><b>${fmtBytes(c.stats.rx)}</b><i>↑</i><b class="tx">${fmtBytes(c.stats.tx)}</b></span>` : "-";
     const statUp = (c) => c.stats ? `${fmtUptime(c.stats.uptime)}<small>PID ${c.stats.pid}</small>` : "-";
-    const STAT_CELLS = { cpu: statCpu, mem: statMem, net: statNet, up: statUp };
+    const STAT_CELLS = { cpu: statCpu, mem: statMem, net: statNet, up: statUp, rows: (c) => cardRows(c) };
 
     function addrCell(c) {
       const v4 = c.ipv4 || [], v6 = c.ipv6 || [];
@@ -743,6 +755,35 @@
         </tr>`;
     }
 
+    function pbar(v, text, right) {
+      const tail = right ? `<span class="mut">${right}</span>` : "";
+      if (v == null) return `<div class="pb"><em>-</em></div>${tail}`;
+      v = Math.max(0, Math.min(100, v));
+      const cls = v >= 85 ? "hi" : v >= 60 ? "mid" : "";
+      return `<div class="pb"><i class="${cls}" style="width:${v.toFixed(1)}%"><b>${text}</b></i></div>${tail}`;
+    }
+    const rateText = (n) => (n == null ? "-" : fmtBytes(n) + "/s");
+    function cardRows(c) {
+      const t = c.stats;
+      const running = !!t;
+      const cpu = running ? pbar(t.cpu, t.cpu == null ? "-" : fmtPct(t.cpu), `${t.cpus ? "核 " + esc(t.cpus) : ""}`) : pbar(null);
+      let mem = pbar(null);
+      if (running && t.mem != null) {
+        const pct = t.mem_max ? t.mem / t.mem_max * 100 : 0;
+        mem = pbar(pct, t.mem_max ? fmtPct(pct) : "-", `${fmtBytes(t.mem, true)} / ${t.mem_max ? fmtBytes(t.mem_max, true) : "不限"}`);
+      }
+      const row = (label, inner) => `<div class="ct-row"><label>${label}</label>${inner}</div>`;
+      const addrs = addrCell(c);
+      return [
+        row("CPU", cpu),
+        row("内存", mem),
+        row("网速", running && t.rx != null ? `<span>↓ ${rateText(t.rx_rate)}</span><span>↑ ${rateText(t.tx_rate)}</span>` : `<span class="mut">-</span>`),
+        row("流量", running && t.rx != null ? `<span>↓ ${fmtBytes(t.rx, true)}</span><span>↑ ${fmtBytes(t.tx, true)}</span>` : `<span class="mut">-</span>`),
+        row("运行", running ? `<span>${fmtUptime(t.uptime)}</span><span class="mut">PID ${t.pid}</span>` : `<span class="mut">-</span>`),
+        row("地址", `<div class="ips">${addrs}</div>`),
+      ].join("");
+    }
+
     function cardHtml(c) {
       const { n, sw, btns, title } = ctParts(c);
       return `<div class="ct-card" data-name="${n}">
@@ -752,13 +793,7 @@
             ${stateBadge(c.state)}
             ${sw}
           </div>
-          <div class="ct-stats">
-            <div><label>CPU</label><div class="stat" data-k="cpu">${statCpu(c)}</div></div>
-            <div><label>内存</label><div class="stat" data-k="mem">${statMem(c)}</div></div>
-            <div><label>已用流量</label><div class="stat" data-k="net">${statNet(c)}</div></div>
-            <div><label>已运行</label><div class="stat" data-k="up">${statUp(c)}</div></div>
-          </div>
-          <div class="ct-addr">${addrCell(c)}</div>
+          <div class="ct-rows" data-k="rows">${cardRows(c)}</div>
           <div class="ct-foot">${btns()}</div>
         </div>`;
     }

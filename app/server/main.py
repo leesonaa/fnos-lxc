@@ -314,6 +314,7 @@ def container_ips(name: str) -> tuple[list, list]:
 
 CGROUP_ROOT = Path(os.environ.get("FNLXC_CGROUP", "/sys/fs/cgroup"))
 _CPU_PREV: dict = {}
+_NET_PREV: dict = {}
 _CPU_LOCK = threading.Lock()
 
 
@@ -386,6 +387,18 @@ def container_stats(name: str, pid: int, mem_limit_mb: int = 0) -> dict:
     st = {"pid": pid, "cpus": f"0-{ncpu - 1}" if ncpu > 1 else "0", "cpu": None,
           "mem": None, "mem_max": None, "rx": None, "tx": None, "uptime": _uptime_s(pid)}
     st["rx"], st["tx"] = _net_bytes(pid)
+    st["rx_rate"] = st["tx_rate"] = None
+    if st["rx"] is not None:
+        t = time.monotonic()
+        with _CPU_LOCK:
+            prev = _NET_PREV.get(name)
+            if prev and t - prev[0] < 1.0:
+                st["rx_rate"], st["tx_rate"] = prev[3], prev[4]  # 短时间内重复请求，沿用上次速率
+            else:
+                if prev and t > prev[0] and st["rx"] >= prev[1] and st["tx"] >= prev[2]:
+                    st["rx_rate"] = (st["rx"] - prev[1]) / (t - prev[0])
+                    st["tx_rate"] = (st["tx"] - prev[2]) / (t - prev[0])
+                _NET_PREV[name] = (t, st["rx"], st["tx"], st["rx_rate"], st["tx_rate"])
     d = _cgroup_dir(pid, name)
     if not d:
         return st
@@ -466,6 +479,8 @@ def list_containers() -> list:
     with _CPU_LOCK:
         for k in [k for k in _CPU_PREV if k not in names]:
             del _CPU_PREV[k]
+        for k in [k for k in _NET_PREV if k not in names]:
+            del _NET_PREV[k]
     return out
 
 
