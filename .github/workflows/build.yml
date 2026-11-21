@@ -22,6 +22,9 @@ jobs:
       - name: Python syntax check
         run: python3 -m py_compile app/server/main.py app/server/lxcconf.py app/server/guestnet.py
 
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+
       - name: Set version from tag
         if: startsWith(github.ref, 'refs/tags/v')
         run: sed -i "s/^version=.*/version=${GITHUB_REF_NAME#v}/" manifest

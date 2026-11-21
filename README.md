@@ -20,7 +20,7 @@
 每个容器的「配置」按钮：主机名、开机自启、网桥/MAC、IPv4 / IPv6（DHCP 或静态）、CPU / 内存上限、
 TUN/TAP、FUSE、GPU 直通（/dev/dri）、Docker 嵌套、目录挂载；另有「高级：原始配置」直接编辑 config。
 表单项写入 config 末尾的受管区块（`# >>> fnos-lxc managed >>>`），每次保存前备份为 `config.fnos-bak`。
-IPv4 设为静态时，会同时关闭容器内 eth0 的 DHCP（ifupdown / systemd-networkd / netplan，原文件备份为 `*.fnos-orig`，改回 DHCP 自动还原），避免出现额外的自动分配地址；保存后需重启容器生效。
+IPv4 设为静态时，会同时关闭容器内 **eth0** 的 DHCP（ifupdown / systemd-networkd / netplan / NetworkManager），避免出现额外的自动分配地址；保存后需重启容器生效。每处改动前会插入一行 `# fnos-lxc:` 标记并记录原值，改回 DHCP 时只撤销带标记的改动；不碰 eth0 以外的网卡，也不会覆盖你在容器里做的其它修改。
 
 **开机自启**：飞牛开机后本应用启动时，会等待数据卷目录和所选网桥就绪（最多 10 分钟），再对勾选了「开机自启」的容器执行一次 `lxc-autostart`（失败自动重试，每次开机只执行一次，日志见 `server.log`）。不依赖系统的 `lxc.service`。
 
@@ -89,4 +89,17 @@ appcenter-cli start fnos-lxc
 mkdir -p /tmp/fnos-lxc-data
 python3 app/server/main.py --port 9100 --data-dir /tmp/fnos-lxc-data --bind 127.0.0.1
 # 浏览器打开 http://127.0.0.1:9100
+```
+
+## 安全与宿主机配置
+
+- 生产模式只监听飞牛统一网关的 Unix socket，并用 `SO_PEERCRED` 校验连接方 uid（默认只信任 root）：本机普通用户即使伪造 `X-Trim-Isadmin` 头也会被拒绝。若网关不是 root 运行，日志（`server.log`）里会出现 `[auth] rejected socket peer uid=N`，把该 uid 加到数据目录 `config.json` 的 `allowed_uids` 数组即可。
+- `--port` TCP 模式仅供本机调试，默认只绑定 `127.0.0.1`，**没有身份认证**，不要绑定到局域网。
+- 初始化会改写 `/etc/lxc/lxc.conf` 和 `default.conf`：首次覆盖前会把原文件备份到数据目录 `orig/`；卸载时若关闭「保留容器数据」，会还原这两个文件，并且只删除由本应用管理的容器（config 里有 `fnos-lxc managed` 区块），不碰其它来源的 LXC 容器。
+- 数据路径不能放在 `/etc`、`/usr` 等系统目录；不在 `/volN` 下时会提示。
+
+## 测试
+
+```bash
+python3 -m unittest discover -s tests -v
 ```

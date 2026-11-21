@@ -589,12 +589,23 @@
     }
 
     async function api(path, opts = {}) {
-      const r = await fetch(path.replace(/^\//, ""), {
-        headers: { "Content-Type": "application/json", "X-Requested-With": "fnos-lxc" },
-        ...opts,
-        body: opts.body ? JSON.stringify(opts.body) : undefined,
-      });
-      return r.json();
+      let r;
+      try {
+        r = await fetch(path.replace(/^\//, ""), {
+          headers: { "Content-Type": "application/json", "X-Requested-With": "fnos-lxc" },
+          ...opts,
+          body: opts.body ? JSON.stringify(opts.body) : undefined,
+        });
+      } catch (e) {
+        return { ok: false, error: "无法连接服务：" + e };
+      }
+      const txt = await r.text();
+      try {
+        return JSON.parse(txt);
+      } catch (e) {
+        // 网关 403、后端 500 等非 JSON 响应：把原因显示出来，而不是静默失败
+        return { ok: false, error: `HTTP ${r.status}：${txt.trim().slice(0, 200) || r.statusText}` };
+      }
     }
 
     let setupStep = 1;
@@ -956,7 +967,16 @@
       $("#pkg-status").textContent = "安装中，请稍候…";
       $("#pkg-log").classList.remove("hidden");
       $("#pkg-log").textContent = "apt-get update && install lxc…\n";
-      const r = await api("/api/setup/install-packages", { method: "POST", body: {} });
+      let r = await api("/api/setup/install-packages", { method: "POST", body: {} });
+      if (r.ok && r.job) {
+        for (;;) {
+          await new Promise((res) => setTimeout(res, 2000));
+          const j = await api(`/api/job/${r.job}`);
+          if (!j.ok && !j.status) { r = j; break; }
+          $("#pkg-status").textContent = `安装中，请稍候…（已用时 ${j.elapsed || 0}s）`;
+          if (j.status === "done" || j.status === "error") { r = j.result || { ok: false, error: j.error }; break; }
+        }
+      }
       $("#pkg-log").textContent += JSON.stringify(r, null, 2);
       if (r.ok || r.has_lxc) {
         $("#pkg-status").textContent = "安装成功";
@@ -1007,7 +1027,7 @@
       $("#final-log").textContent += JSON.stringify(r, null, 2);
       if (r.ok) {
         showSetup(4);
-        toast("初始化完成");
+        toast(r.warning ? "初始化完成。" + r.warning : "初始化完成");
       } else {
         toast("失败：" + (r.error || "unknown"));
       }
@@ -1152,6 +1172,7 @@
     function mountRow(m = { host: "", container: "", readonly: false }) {
       const d = document.createElement("div");
       d.className = "mount-row";
+      d.dataset.options = JSON.stringify(m.options || []);  // 表单不展示的选项（optional 等）原样带回
       d.innerHTML = `<input type="text" class="m-host" placeholder="宿主机路径 /vol1/1000/media" value="${esc(m.host)}">
         <input type="text" class="m-ct" placeholder="容器内路径 /media" value="${esc(m.container)}">
         <label class="check" style="margin:0"><input type="checkbox" class="m-ro" ${m.readonly ? "checked" : ""}>只读</label>
@@ -1213,6 +1234,7 @@
           host: r.querySelector(".m-host").value.trim(),
           container: r.querySelector(".m-ct").value.trim(),
           readonly: r.querySelector(".m-ro").checked,
+          options: JSON.parse(r.dataset.options || "[]"),
         })),
       };
     }

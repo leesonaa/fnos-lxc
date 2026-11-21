@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import ipaddress
+import math
 import re
 
 BEGIN = "# >>> fnos-lxc managed (由管理界面生成，请勿手动编辑此区块) >>>"
@@ -36,6 +37,10 @@ _DEV_FUSE = "c 10:229 rwm"
 _DEV_DRI = "c 226:* rwm"
 
 _WEBUI_RE = re.compile(r"^#\s*fnos\.webui\s*=\s*(.*)$", re.M)
+_OPT_RE = re.compile(r"^[A-Za-z0-9_=.:-]+$")
+_PLAIN_OPTS = {"bind", "ro", "rw", "create=dir", "create=file"}
+MAX_CPU_CORES = 1024
+MAX_MEM_MB = 16 * 1024 * 1024  # 16 TB，只用来挡住荒谬输入
 _HOST_RE = re.compile(r"^[A-Za-z0-9._-]{1,63}$")
 _BRIDGE_RE = re.compile(r"^[A-Za-z0-9._:-]{1,15}$")
 _MAC_RE = re.compile(r"^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$")
@@ -159,6 +164,8 @@ def parse_settings(text: str) -> dict:
                         "host": host,
                         "container": "/" + ct.lstrip("/"),
                         "readonly": "ro" in opts.split(","),
+                        # 表单不认识的选项（optional、nosuid 等）原样保留，避免保存后丢失
+                        "options": [o for o in opts.split(",") if o and o not in _PLAIN_OPTS],
                     }
                 )
     if _DEV_TUN in allow:
@@ -251,11 +258,16 @@ def validate(raw: dict) -> tuple[dict | None, str]:
 
     try:
         cores = float(raw.get("cpu_cores") or 0)
-        mem = int(float(raw.get("memory_mb") or 0))
+        mem_f = float(raw.get("memory_mb") or 0)
     except (TypeError, ValueError):
         return None, "CPU / 内存必须是数字"
-    if cores < 0 or mem < 0:
+    if not (math.isfinite(cores) and math.isfinite(mem_f)):
+        return None, "CPU / 内存必须是有限的数字"
+    if cores < 0 or mem_f < 0:
         return None, "CPU / 内存不能为负数"
+    if cores > MAX_CPU_CORES or mem_f > MAX_MEM_MB:
+        return None, "CPU / 内存数值过大"
+    mem = int(mem_f)
     s["cpu_cores"] = cores
     s["memory_mb"] = mem
 
@@ -273,7 +285,10 @@ def validate(raw: dict) -> tuple[dict | None, str]:
             return None, "挂载路径含非法字符"
         if c.strip("/") == "":
             return None, "容器内路径不能是根目录 /"
-        s["mounts"].append({"host": h, "container": c, "readonly": bool(m.get("readonly"))})
+        extra = [str(o) for o in (m.get("options") or []) if str(o) not in _PLAIN_OPTS]
+        if any(not _OPT_RE.match(o) for o in extra):
+            return None, "挂载选项含非法字符"
+        s["mounts"].append({"host": h, "container": c, "readonly": bool(m.get("readonly")), "options": extra})
     return s, ""
 
 
@@ -286,7 +301,7 @@ def _should_strip(key: str, value: str) -> bool:
         return True
     if key == "lxc.mount.auto" and value.startswith("proc:rw sys:rw"):
         return True
-    if key == "lxc.cgroup2.devices.allow" and value in (_DEV_TUN, _DEV_FUSE, _DEV_DRI, "a"):
+    if key == "lxc.cgroup2.devices.allow" and value in (_DEV_TUN, _DEV_FUSE, _DEV_DRI):
         return True
     if key == "lxc.mount.entry":
         parts = value.split()
@@ -363,7 +378,7 @@ def build_block(s: dict, bind_is_file=lambda p: False) -> list[str]:
             "lxc.mount.auto = proc:rw sys:rw",
         ]
     for m in s["mounts"]:
-        opts = "bind," + ("ro," if m["readonly"] else "") + (
+        opts = "bind," + ("ro," if m["readonly"] else "") + "".join(o + "," for o in m.get("options", [])) + (
             "create=file" if bind_is_file(m["host"]) else "create=dir"
         )
         L.append(
@@ -376,3 +391,13 @@ def build_block(s: dict, bind_is_file=lambda p: False) -> list[str]:
 def apply_settings(text: str, s: dict, bind_is_file=lambda p: False) -> str:
     base = _strip_existing(text)
     return "\n".join(base + [""] + build_block(s, bind_is_file)) + "\n"
+
+
+def valid_bridge(name: str) -> bool:
+    return bool(_BRIDGE_RE.match(str(name or "")))
+
+
+def kv_effective(text: str):
+    """真正生效（非注释）的 (key, value) 行。"""
+    for _, k, v in _kv_lines(text):
+        yield k, v

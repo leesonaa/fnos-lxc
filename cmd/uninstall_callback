@@ -3,13 +3,24 @@
 DATA_DIR="${TRIM_PKGVAR:-/vol1/@appdata/fnos-lxc}"
 
 if [ "${wizard_keep_data:-true}" = "false" ]; then
-  # 仅删除 lxc-ls 能列出的容器（位于已配置的 lxcpath 内）
+  # 只清理由本应用管理的容器（config 里有 fnos-lxc 受管区块），不碰用户其它来源的 LXC 容器
   if command -v lxc-ls >/dev/null 2>&1; then
+    LXCPATH="$(lxc-config lxc.lxcpath 2>/dev/null || echo /var/lib/lxc)"
     for n in $(lxc-ls -1 2>/dev/null); do
-      lxc-stop -n "$n" -k 2>/dev/null || true
-      lxc-destroy -n "$n" -f 2>/dev/null || true
+      if grep -q "fnos-lxc managed" "${LXCPATH}/${n}/config" 2>/dev/null; then
+        lxc-stop -n "$n" -k 2>/dev/null || true
+        lxc-destroy -n "$n" -f 2>/dev/null || true
+      else
+        echo "skip container not managed by fnos-lxc: $n"
+      fi
     done
   fi
+  # 还原初始化时备份的宿主机 LXC 配置
+  for f in lxc.conf default.conf; do
+    if [ -f "${DATA_DIR}/orig/${f}" ]; then
+      cp -f "${DATA_DIR}/orig/${f}" "/etc/lxc/${f}" 2>/dev/null || true
+    fi
+  done
   rm -rf "${DATA_DIR}" 2>/dev/null || true
 fi
 echo "fnos-lxc uninstall_callback ok"

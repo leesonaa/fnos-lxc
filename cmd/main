@@ -11,11 +11,17 @@ SOCK="${APP_DIR}/app.sock"
 
 mkdir -p "${DATA_DIR}"
 
+# PID 文件在数据卷上，重启后可能残留，PID 又可能被别的进程复用：必须核对命令行
+is_ours() {
+  [ -n "$1" ] && [ -r "/proc/$1/cmdline" ] && tr '\0' ' ' < "/proc/$1/cmdline" | grep -qF "${SERVER}"
+}
+
 start() {
-  if [ -f "${PID_FILE}" ] && kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+  if [ -f "${PID_FILE}" ] && is_ours "$(cat "${PID_FILE}")"; then
     echo "${APP_NAME} already running"
     return 0
   fi
+  rm -f "${PID_FILE}"
   cd "${APP_DIR}/server"
   if ! command -v python3 >/dev/null 2>&1; then
     echo "python3 not found" >> "${TRIM_TEMP_LOGFILE:-/dev/stderr}"
@@ -24,7 +30,7 @@ start() {
   nohup python3 "${SERVER}" --socket "${SOCK}" --data-dir "${DATA_DIR}" >> "${LOG_FILE}" 2>&1 &
   echo $! > "${PID_FILE}"
   sleep 1
-  if ! kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+  if ! is_ours "$(cat "${PID_FILE}")"; then
     tail -n 20 "${LOG_FILE}" >> "${TRIM_TEMP_LOGFILE:-/dev/stderr}" 2>/dev/null
     rm -f "${PID_FILE}"
     return 1
@@ -35,7 +41,7 @@ start() {
 stop() {
   if [ -f "${PID_FILE}" ]; then
     PID=$(cat "${PID_FILE}")
-    if kill -0 "${PID}" 2>/dev/null; then
+    if is_ours "${PID}"; then
       kill "${PID}" 2>/dev/null || true
       sleep 1
       kill -9 "${PID}" 2>/dev/null || true
@@ -49,7 +55,7 @@ stop() {
 }
 
 status() {
-  if [ -f "${PID_FILE}" ] && kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+  if [ -f "${PID_FILE}" ] && is_ours "$(cat "${PID_FILE}")"; then
     exit 0
   fi
   exit 3

@@ -11,6 +11,8 @@ import os
 import pty
 import re
 import secrets
+import select
+import shutil
 import signal
 import socket
 import socketserver
@@ -112,7 +114,25 @@ def run(cmd, timeout=120, input_text=None):
 
 
 def which(bin_name: str) -> bool:
-    return run(f"command -v {bin_name}").get("ok", False)
+    return shutil.which(bin_name) is not None
+
+
+def _clamp_int(v, default: int, lo: int, hi: int) -> int:
+    try:
+        return max(lo, min(hi, int(float(v))))
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _atomic_write(p: Path, text: str) -> None:
+    """先写临时文件再 rename，避免写到一半断电/崩溃留下残缺的 config。"""
+    tmp = p.with_name(p.name + ".fnos-tmp")
+    tmp.write_text(text)
+    try:
+        os.chmod(tmp, p.stat().st_mode & 0o777)
+    except OSError:
+        pass
+    os.replace(tmp, p)
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +178,34 @@ def detect_data_volumes() -> list:
     return vols[:20] or ["/vol1"]
 
 
+def start_install_job() -> dict:
+    """apt 安装可能超过网关/浏览器超时：放后台线程，前端轮询 /api/job/<id>。"""
+    with _JOBS_LOCK:
+        for j in _JOBS.values():
+            if j.get("kind") == "install" and j["status"] == "running":
+                return {"ok": True, "job": j["id"]}
+        jid = f"{int(time.time() * 1000)}"
+        job = {"id": jid, "kind": "install", "name": "lxc", "status": "running", "progress": 5,
+               "stage": "安装 LXC 软件包（可能需要几分钟）", "log": [], "elapsed": 0, "error": "", "result": None}
+        _JOBS[jid] = job
+
+    def work():
+        t0 = time.time()
+        try:
+            res = step_install_packages()
+        except Exception as e:  # noqa: BLE001
+            res = {"ok": False, "step": "exception", "detail": {"stderr": str(e)}, "has_lxc": False}
+        err = ""
+        if not res.get("ok"):
+            d = res.get("detail") or {}
+            err = f"{res.get('step', '')}: {(d.get('stderr') or d.get('stdout') or '').splitlines()[-1:] or ['失败']}"[:300]
+        _job_set(job, status="done" if res.get("ok") else "error", progress=100, result=res, error=err,
+                 elapsed=int(time.time() - t0))
+
+    threading.Thread(target=work, daemon=True).start()
+    return {"ok": True, "job": jid}
+
+
 def step_install_packages() -> dict:
     """apt install native lxc stack."""
     if which("lxc-ls") and which("lxc-create"):
@@ -187,16 +235,37 @@ def step_install_packages() -> dict:
     return {"ok": ok, "step": "packages", "detail": r2, "has_lxc": ok}
 
 
+_SYSTEM_DIRS = ("/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/proc", "/sys", "/dev", "/run", "/root")
+
+
+def check_lxcpath(lxcpath: str) -> tuple[str, str, str]:
+    """返回 (规范化路径, 错误, 警告)。"""
+    p = str(lxcpath or "").strip().rstrip("/")
+    if not p.startswith("/") or p.count("/") < 2:
+        return "", "请填写数据卷下的绝对路径，例如 /vol1/1000/lxc", ""
+    if any(ord(c) < 32 or c == "\x7f" for c in p):
+        return "", "路径含非法字符", ""
+    p = os.path.normpath(p)
+    if any(p == d or p.startswith(d + "/") for d in _SYSTEM_DIRS):
+        return "", "不能把容器放在系统目录下，请选择数据卷（/vol1 等）", ""
+    warn = ""
+    if not re.match(r"^/vol\d+(/|$)", p):
+        warn = "所选路径不在飞牛数据卷（/volN）下，容器会占用该路径所在磁盘的空间"
+    return p, "", warn
+
+
 def step_configure_storage(lxcpath: str) -> dict:
-    lxcpath = lxcpath.strip().rstrip("/")
-    if not lxcpath.startswith("/") or lxcpath.count("/") < 2:
-        return {"ok": False, "error": "请填写数据卷下的绝对路径，例如 /vol1/1000/lxc"}
+    lxcpath, err, warn0 = check_lxcpath(lxcpath)
+    if err:
+        return {"ok": False, "error": err}
     cache = Path(lxcpath) / "cache"
     try:
         cache.mkdir(parents=True, exist_ok=True)
+        if not os.access(lxcpath, os.W_OK):
+            return {"ok": False, "error": "所选路径不可写"}
     except OSError as e:
         return {"ok": False, "error": f"无法创建目录: {e}"}
-    warn = ""
+    warn = warn0
     # /var/lib/lxc、/var/cache/lxc 仅在为空/不存在/已是软链时指向用户路径；
     # 真正生效的是 /etc/lxc/lxc.conf 里的 lxc.lxcpath
     for link, target in (("/var/lib/lxc", lxcpath), ("/var/cache/lxc", str(cache))):
@@ -208,7 +277,7 @@ def step_configure_storage(lxcpath: str) -> dict:
             lp.rmdir()
             run(["ln", "-sfn", target, link])
         elif link == "/var/lib/lxc":
-            warn = "/var/lib/lxc 下已有内容，未迁移；新容器将创建在所选路径"
+            warn = (warn + "；" if warn else "") + "/var/lib/lxc 下已有内容，未迁移；新容器将创建在所选路径"
     return {"ok": True, "lxcpath": lxcpath, "warning": warn}
 
 
@@ -225,21 +294,39 @@ lxc.net.0.name = eth0
 lxc.apparmor.profile = generated
 lxc.apparmor.allow_nesting = 1
 """
-    Path("/etc/lxc/lxc.conf").write_text(lxc_conf)
-    Path("/etc/lxc/default.conf").write_text(default_conf)
+    # 覆盖前先备份宿主机原有配置（只在首次、且原文件不是本程序写的时候备份），卸载时可还原
+    orig = DATA_DIR / "orig"
+    backed = []
+    for name, text in (("lxc.conf", lxc_conf), ("default.conf", default_conf)):
+        dst = Path("/etc/lxc") / name
+        try:
+            old = dst.read_text()
+        except OSError:
+            old = None
+        if old is not None and "managed by fnos-lxc" not in old and not (orig / name).exists():
+            orig.mkdir(parents=True, exist_ok=True)
+            (orig / name).write_text(old)
+            backed.append(name)
+        if dst.exists():
+            _atomic_write(dst, text)
+        else:
+            dst.write_text(text)
     # also keep a copy in data dir
     (DATA_DIR / "lxc.conf").write_text(lxc_conf)
     (DATA_DIR / "default.conf").write_text(default_conf)
-    return {"ok": True}
+    return {"ok": True, "backed_up": backed}
 
 
 def finalize_init(lxcpath: str, bridge: str, timeout: int = 15) -> dict:
     r1 = step_configure_storage(lxcpath)
     if not r1["ok"]:
         return r1
-    r2 = step_write_lxc_conf(lxcpath, bridge, timeout)
+    r2 = step_write_lxc_conf(r1["lxcpath"], bridge, timeout)
     if not r2["ok"]:
         return r2
+    if r2.get("backed_up"):
+        r1["warning"] = (r1.get("warning", "") + "；" if r1.get("warning") else "") + \
+            f"已备份原有 LXC 配置（{', '.join(r2['backed_up'])}）到 {DATA_DIR / 'orig'}，卸载时可还原"
     cfg = load_config()
     cfg.update(
         {
@@ -521,7 +608,7 @@ def set_autostart(name: str, enabled: bool) -> dict:
     if not s["bridge"]:
         s["bridge"] = load_config().get("bridge") or "br0"
     s["autostart"] = bool(enabled)
-    return save_container_settings(name, s)
+    return save_container_settings(name, s, check_mounts=False)
 
 
 def container_state(name: str) -> str:
@@ -604,7 +691,6 @@ def _http(url: str, method="GET", timeout=15):
 
 def image_index(mid: str = "") -> list:
     """镜像站的完整镜像索引（按镜像站缓存 1 小时）。"""
-    import time
     mid = mirror_id(mid)
     now = time.time()
     c = _IDX_CACHE.get(mid)
@@ -648,10 +734,12 @@ def _job_set(job: dict, **kw) -> None:
 
 
 def _find_rootfs_download(distro: str, release: str, arch: str):
+    """下载模板的缓存目录层级固定：<cache>/download/<distro>/<release>/<arch>/default/<build>/rootfs.*
+    只做定深度的 glob，绝不递归遍历容器目录。"""
     import glob
     best = None
-    for base in ("/var/cache/lxc", str(lxc_base()), "/var/cache"):
-        for f in glob.glob(f"{base}/**/{distro}/{release}/{arch}/default/**/rootfs.tar.*", recursive=True):
+    for base in ("/var/cache/lxc", str(lxc_base() / "cache")):
+        for f in glob.glob(f"{base}/download/{distro}/{release}/{arch}/default/*/rootfs.*"):
             try:
                 if best is None or os.path.getmtime(f) > os.path.getmtime(best):
                     best = f
@@ -663,7 +751,6 @@ def _find_rootfs_download(distro: str, release: str, arch: str):
 
 
 def _create_worker(job: dict, name: str, distro: str, release: str, arch: str, autostart: bool, mid: str) -> None:
-    import time
     t0 = time.time()
     argv = ["lxc-create", "-n", name, "-t", "download", "--", "-d", distro, "-r", release, "-a", arch]
     if mid != "official":
@@ -724,12 +811,11 @@ def _create_worker(job: dict, name: str, distro: str, release: str, arch: str, a
         s = lxcconf.parse_settings(text)
         s["autostart"] = bool(autostart)
         s["bridge"] = s["bridge"] or load_config().get("bridge") or "br0"
-        p.write_text(lxcconf.apply_settings(text, s))
+        _atomic_write(p, lxcconf.apply_settings(text, s))
     _job_set(job, status="done", progress=100, stage="完成")
 
 
 def create_container(body: dict) -> dict:
-    import time
     name = clean_name(body.get("name", ""))
     distro = re.sub(r"[^a-z0-9]", "", str(body.get("distro", "alpine")).lower())
     release = re.sub(r"[^A-Za-z0-9._-]", "", str(body.get("release", "3.21")))
@@ -796,7 +882,7 @@ def get_container_settings(name: str) -> dict:
     }
 
 
-def save_container_settings(name: str, raw: dict) -> dict:
+def save_container_settings(name: str, raw: dict, check_mounts: bool = True) -> dict:
     name = clean_name(name)
     p = ct_config_path(name) if name else None
     if not p:
@@ -804,14 +890,16 @@ def save_container_settings(name: str, raw: dict) -> dict:
     s, err = lxcconf.validate(raw)
     if err:
         return {"ok": False, "error": err}
-    for m in s["mounts"]:
+    for m in s["mounts"] if check_mounts else []:
+        if "optional" in m.get("options", []):
+            continue
         if not Path(m["host"]).exists():
             return {"ok": False, "error": f"宿主机路径不存在：{m['host']}"}
     with _CONF_LOCK:
         text = p.read_text(errors="ignore")
         new = lxcconf.apply_settings(text, s, bind_is_file=lambda x: Path(x).is_file())
         (p.parent / "config.fnos-bak").write_text(text)
-        p.write_text(new)
+        _atomic_write(p, new)
     _sync_guest_net(p, new)
     _prepare_host_devices(s)
     return {"ok": True, "needs_restart": container_state(name) in ("RUNNING", "FROZEN")}
@@ -839,11 +927,14 @@ def save_container_raw(name: str, text: str) -> dict:
     p = ct_config_path(name) if name else None
     if not p:
         return {"ok": False, "error": "容器不存在"}
-    if "lxc.rootfs.path" not in text:
-        return {"ok": False, "error": "配置中缺少 lxc.rootfs.path，已拒绝保存"}
+    text = text.replace("\r\n", "\n")
+    if "\0" in text or len(text) > 256 * 1024:
+        return {"ok": False, "error": "配置内容无效或过大"}
+    if not any(k == "lxc.rootfs.path" and v for k, v in lxcconf.kv_effective(text)):
+        return {"ok": False, "error": "配置中缺少有效的 lxc.rootfs.path（注释行不算），已拒绝保存"}
     with _CONF_LOCK:
         (p.parent / "config.fnos-bak").write_text(p.read_text(errors="ignore"))
-        p.write_text(text.replace("\r\n", "\n").rstrip("\n") + "\n")
+        _atomic_write(p, text.rstrip("\n") + "\n")
     _sync_guest_net(p, p.read_text(errors="ignore"))
     return {"ok": True, "needs_restart": container_state(name) in ("RUNNING", "FROZEN")}
 
@@ -866,35 +957,50 @@ def _ws_send(wfile, lock, opcode: int, payload: bytes) -> None:
         wfile.flush()
 
 
+WS_MAX_MESSAGE = 1024 * 1024  # 单条消息（含分片累计）上限
+WS_IDLE_TIMEOUT = 90  # 秒；服务端每 30 秒发 ping，浏览器会自动回 pong
+
+
+def _read_exact(rfile, n: int) -> bytes:
+    buf = rfile.read(n)
+    if buf is None or len(buf) < n:
+        raise EOFError
+    return buf
+
+
 def _ws_recv(rfile):
-    """返回 (opcode, payload)；连接断开返回 (8, b"")。支持分片。"""
-    data, op0 = b"", 0
-    while True:
-        h = rfile.read(2)
-        if len(h) < 2:
-            return 8, b""
-        b1, b2 = h
-        fin, op = b1 & 0x80, b1 & 0x0F
-        n = b2 & 0x7F
-        if n == 126:
-            n = struct.unpack("!H", rfile.read(2))[0]
-        elif n == 127:
-            n = struct.unpack("!Q", rfile.read(8))[0]
-        mask = rfile.read(4) if b2 & 0x80 else b""
-        if n > 4 * 1024 * 1024:
-            return 8, b""
-        buf = rfile.read(n) if n else b""
-        if len(buf) < n:
-            return 8, b""
-        if mask:
-            buf = bytes(c ^ mask[i % 4] for i, c in enumerate(buf))
-        if op in (8, 9, 10):
-            return op, buf
-        if op != 0:
-            op0 = op
-        data += buf
-        if fin:
-            return op0, data
+    """返回 (opcode, payload)；连接断开/协议错误返回 (8, b"")。支持分片，强制客户端掩码。"""
+    data, op0 = bytearray(), 0
+    try:
+        while True:
+            b1, b2 = _read_exact(rfile, 2)
+            fin, rsv, op = b1 & 0x80, b1 & 0x70, b1 & 0x0F
+            n = b2 & 0x7F
+            if rsv or not (b2 & 0x80):  # RSV 位必须为 0；客户端帧必须带掩码（RFC 6455 §5.1）
+                return 8, b""
+            if n == 126:
+                n = struct.unpack("!H", _read_exact(rfile, 2))[0]
+            elif n == 127:
+                n = struct.unpack("!Q", _read_exact(rfile, 8))[0]
+            mask = _read_exact(rfile, 4)
+            if op >= 8 and (n > 125 or not fin):  # 控制帧不能分片、载荷 ≤125
+                return 8, b""
+            if n > WS_MAX_MESSAGE or len(data) + n > WS_MAX_MESSAGE:
+                return 8, b""
+            buf = _read_exact(rfile, n) if n else b""
+            if n:
+                # 用大整数异或代替逐字节循环
+                key = (mask * (n // 4 + 1))[:n]
+                buf = (int.from_bytes(buf, "big") ^ int.from_bytes(key, "big")).to_bytes(n, "big")
+            if op in (8, 9, 10):
+                return op, buf
+            if op != 0:
+                op0 = op
+            data += buf
+            if fin:
+                return op0, bytes(data)
+    except (EOFError, struct.error, OSError):
+        return 8, b""
 
 
 def _set_winsize(fd: int, rows: int, cols: int) -> None:
@@ -930,6 +1036,9 @@ def _terminal_argv(name: str) -> list:
     return argv + ["--", "/bin/sh", "-c", _SHELL]
 
 
+_TERM_SLOTS = threading.BoundedSemaphore(8)  # 同时最多 8 个终端
+
+
 def terminal_session(handler, name: str, cols: int, rows: int) -> None:
     """已完成 WebSocket 握手后，把 PTY 与 WebSocket 对接。"""
     rfile, wfile = handler.rfile, handler.wfile
@@ -937,23 +1046,41 @@ def terminal_session(handler, name: str, cols: int, rows: int) -> None:
     master, slave = pty.openpty()
     _set_winsize(master, rows, cols)
     argv = _terminal_argv(name)
-
-    def _ctty():
-        # 让 PTY 成为子进程的控制终端，shell 才有作业控制、Ctrl+C 才能生效
-        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
-
-    proc = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave, start_new_session=True, close_fds=True, preexec_fn=_ctty)
-    os.close(slave)
+    # 用 setsid -c 让 PTY 成为控制终端（shell 才有作业控制、Ctrl+C 才生效）。
+    # 不用 preexec_fn：它在多线程服务里可能死锁。没有 setsid 时退化为仅新会话。
+    use_setsid = which("setsid")
+    if use_setsid:
+        argv = ["setsid", "-c"] + argv
+    try:
+        proc = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave,
+                                start_new_session=not use_setsid, close_fds=True)
+    except OSError:
+        os.close(master)
+        raise
+    finally:
+        os.close(slave)
     alive = threading.Event()
     alive.set()
+    try:
+        handler.connection.settimeout(WS_IDLE_TIMEOUT)
+    except OSError:
+        pass
 
     def pump():
+        last_ping = time.monotonic()
         try:
             while alive.is_set():
-                data = os.read(master, 65536)
-                if not data:
+                r, _, _ = select.select([master], [], [], 5)
+                if r:
+                    data = os.read(master, 65536)
+                    if not data:
+                        break
+                    _ws_send(wfile, lock, 2, data)
+                elif time.monotonic() - last_ping > 30:
+                    _ws_send(wfile, lock, 9, b"")
+                    last_ping = time.monotonic()
+                if proc.poll() is not None and not r:
                     break
-                _ws_send(wfile, lock, 2, data)
         except OSError:
             pass
         finally:
@@ -978,22 +1105,25 @@ def terminal_session(handler, name: str, cols: int, rows: int) -> None:
             elif op == 1:
                 try:
                     msg = json.loads(payload.decode("utf-8"))
-                except ValueError:
+                    if msg.get("type") == "resize":
+                        _set_winsize(master, max(1, min(500, int(msg.get("rows", 24)))),
+                                     max(1, min(1000, int(msg.get("cols", 80)))))
+                except (ValueError, TypeError, AttributeError):
                     continue
-                if msg.get("type") == "resize":
-                    _set_winsize(master, max(1, int(msg.get("rows", 24))), max(1, int(msg.get("cols", 80))))
-    except (OSError, struct.error):
+    except OSError:
         pass
     finally:
         alive.clear()
-        try:
-            os.killpg(proc.pid, signal.SIGHUP)
-        except OSError:
-            pass
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        for sig in (signal.SIGHUP, signal.SIGKILL):
+            try:
+                os.killpg(proc.pid, sig)
+            except OSError:
+                break
+            try:
+                proc.wait(timeout=2)
+                break
+            except subprocess.TimeoutExpired:
+                continue
         try:
             os.close(master)
         except OSError:
@@ -1035,8 +1165,33 @@ class Handler(BaseHTTPRequestHandler):
             return path[len(GATEWAY_PREFIX):] or "/"
         return path
 
+    def _peer_uid(self):
+        try:
+            creds = self.connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+            return struct.unpack("3i", creds)[1]
+        except (OSError, AttributeError, struct.error):
+            return None
+
     def _gateway_denied(self) -> bool:
-        if not self.gateway or self.headers.get("X-Trim-Isadmin", "").lower() == "true":
+        if not self.gateway:
+            return False
+        # 先验证「谁连进来的」：X-Trim-* 头可以被本机任何能连上 socket 的用户伪造，
+        # 只有来自受信任 uid（默认 root，即飞牛网关）的连接才采信这些头。
+        uid = self._peer_uid()
+        allowed = {0, os.getuid()}
+        for x in load_config().get("allowed_uids") or []:
+            if isinstance(x, int):
+                allowed.add(x)
+        if uid not in allowed:
+            print(f"[auth] rejected socket peer uid={uid}; add it to allowed_uids in {CONFIG_FILE} if it is the gateway", flush=True)
+            msg = f"拒绝访问：连接进程 uid={uid} 不受信任。".encode("utf-8")
+            self.send_response(403)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(msg)))
+            self.end_headers()
+            self.wfile.write(msg)
+            return True
+        if self.headers.get("X-Trim-Isadmin", "").lower() == "true":
             return False
         body = "仅飞牛管理员可使用 LXC 管理。".encode("utf-8")
         self.send_response(403)
@@ -1082,7 +1237,7 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/", ""):
             path = "/index.html"
         fs = (STATIC_DIR / path.lstrip("/")).resolve()
-        if not str(fs).startswith(str(STATIC_DIR.resolve())) or not fs.is_file():
+        if not fs.is_relative_to(STATIC_DIR.resolve()) or not fs.is_file():
             self.send_error(404)
             return
         ctype = "text/html; charset=utf-8"
@@ -1101,7 +1256,26 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _guard(self, fn):
+        try:
+            fn()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            try:
+                self._json(500, {"ok": False, "error": f"内部错误：{type(e).__name__}: {e}"})
+            except OSError:
+                pass
+
     def do_GET(self):
+        self._guard(self._do_GET)
+
+    def do_POST(self):
+        self._guard(self._do_POST)
+
+    def _do_GET(self):
         if self._gateway_denied():
             return
         u = urlparse(self.path)
@@ -1122,7 +1296,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._serve_static(path)
 
-    def do_POST(self):
+    def _do_POST(self):
         if self._gateway_denied():
             return
         u = urlparse(self.path)
@@ -1148,6 +1322,15 @@ class Handler(BaseHTTPRequestHandler):
         if container_state(name) != "RUNNING":
             self._json(409, {"ok": False, "error": "容器未运行"})
             return
+        if not _TERM_SLOTS.acquire(blocking=False):
+            self._json(429, {"ok": False, "error": "终端数量已达上限，请先关闭其它终端"})
+            return
+        try:
+            self._handle_term_ws(name, key, qs)
+        finally:
+            _TERM_SLOTS.release()
+
+    def _handle_term_ws(self, name, key, qs):
         accept = base64.b64encode(hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
         self.send_response(101, "Switching Protocols")
         self.send_header("Upgrade", "websocket")
@@ -1223,14 +1406,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_api_post(self, path, body):
         if path == "/api/setup/install-packages":
-            self._json(200, step_install_packages())
+            self._json(200, start_install_job())
             return
 
         if path == "/api/setup/finalize":
             lxcpath = body.get("lxcpath") or "/vol1/lxc"
             bridge = body.get("bridge") or "br0"
-            timeout = int(body.get("timeout") or 15)
-            self._json(200, finalize_init(lxcpath, bridge, timeout))
+            if not lxcconf.valid_bridge(bridge):
+                self._json(200, {"ok": False, "error": "网桥名称无效"})
+                return
+            self._json(200, finalize_init(lxcpath, bridge, _clamp_int(body.get("timeout"), 15, 1, 600)))
             return
 
         if path == "/api/container/create":
@@ -1264,17 +1449,28 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/config/save":
             cfg = load_config()
-            for k in ("timeout", "autostart_delay", "bridge", "lxcpath", "service_enabled"):
+            if "bridge" in body:
+                if body["bridge"] and not lxcconf.valid_bridge(body["bridge"]):
+                    self._json(200, {"ok": False, "error": "网桥名称无效"})
+                    return
+                cfg["bridge"] = body["bridge"]
+            for k, lo, hi in (("timeout", 1, 600), ("autostart_delay", 0, 600)):
                 if k in body:
-                    cfg[k] = body[k]
+                    cfg[k] = _clamp_int(body[k], cfg.get(k, 15), lo, hi)
+            if "service_enabled" in body:
+                cfg["service_enabled"] = bool(body["service_enabled"])
+            warning = ""
+            if "lxcpath" in body:
+                cfg["lxcpath"] = body["lxcpath"]
             if cfg.get("lxcpath") and cfg.get("bridge"):
                 r = step_configure_storage(cfg["lxcpath"])
                 if not r["ok"]:
                     self._json(200, r)
                     return
+                cfg["lxcpath"], warning = r["lxcpath"], r.get("warning", "")
                 step_write_lxc_conf(cfg["lxcpath"], cfg["bridge"], int(cfg.get("timeout") or 15))
             save_config(cfg)
-            self._json(200, {"ok": True, "config": cfg})
+            self._json(200, {"ok": True, "config": cfg, "warning": warning})
             return
 
         self._json(404, {"error": "not found"})
@@ -1351,7 +1547,9 @@ def make_unix_server(path: str) -> UnixHTTPServer:
     except FileNotFoundError:
         pass
     srv = UnixHTTPServer(path, GatewayHandler)
-    os.chmod(path, 0o666)  # 网关进程需要能连接
+    # 0666 只是让「任何进程都能连上并拿到明确的 403 提示」；真正的准入在 Handler._gateway_denied
+    # 里用 SO_PEERCRED 校验对端 uid，不信任客户端自报的 X-Trim-* 头。
+    os.chmod(path, 0o666)
     return srv
 
 
@@ -1360,7 +1558,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=9100)
     parser.add_argument("--data-dir", default=str(DATA_DIR))
-    parser.add_argument("--bind", default="0.0.0.0")
+    parser.add_argument("--bind", default="127.0.0.1", help="仅调试用的 TCP 模式；该模式没有身份认证，勿绑定到局域网")
     parser.add_argument("--socket", default="", help="统一网关 Unix Socket 路径")
     args = parser.parse_args()
     DATA_DIR = Path(args.data_dir)
@@ -1373,6 +1571,8 @@ def main():
         server = make_unix_server(args.socket)
         print(f"fnos-lxc gateway socket {args.socket}, data={DATA_DIR}", flush=True)
     else:
+        if args.bind not in ("127.0.0.1", "::1", "localhost"):
+            print("WARNING: TCP 模式没有身份认证，绑定到非本机地址会把 root 级容器管理暴露给局域网", flush=True)
         server = ThreadingHTTPServer((args.bind, args.port), Handler)
         print(f"fnos-lxc listening on {args.bind}:{args.port}, data={DATA_DIR}", flush=True)
     try:
