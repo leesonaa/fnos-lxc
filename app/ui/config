@@ -4,9 +4,10 @@
       "title": "LXC 容器",
       "icon": "images/icon-{0}.png",
       "type": "iframe",
-      "protocol": "http",
-      "port": "9100",
-      "url": "/",
+      "protocol": "",
+      "gatewayPrefix": "/app/fnos-lxc",
+      "gatewaySocket": "app.sock",
+      "url": "/app/fnos-lxc/",
       "allUsers": false
     }
   }

@@ -10,7 +10,10 @@ import json
 import os
 import pty
 import re
+import secrets
 import signal
+import socket
+import socketserver
 import struct
 import subprocess
 import termios
@@ -33,6 +36,27 @@ CONFIG_FILE = DATA_DIR / "config.json"
 STATIC_DIR = Path(__file__).resolve().parent.parent / "ui"
 SYS_NET = Path(os.environ.get("FNLXC_SYS_NET", "/sys/class/net"))
 _CONF_LOCK = threading.Lock()
+GATEWAY_PREFIX = "/app/fnos-lxc"
+CSRF_HEADER = ("X-Requested-With", "fnos-lxc")
+_TERM_TOKENS: dict = {}
+_TERM_LOCK = threading.Lock()
+
+
+def issue_term_token(name: str) -> str:
+    """一次性、30 秒有效，把 WebSocket 绑定到已通过认证的 POST 请求（防跨站 WebSocket 劫持）。"""
+    tok = secrets.token_urlsafe(24)
+    now = time.monotonic()
+    with _TERM_LOCK:
+        for k in [k for k, v in _TERM_TOKENS.items() if v[1] < now]:
+            del _TERM_TOKENS[k]
+        _TERM_TOKENS[tok] = (name, now + 30)
+    return tok
+
+
+def consume_term_token(tok: str, name: str) -> bool:
+    with _TERM_LOCK:
+        item = _TERM_TOKENS.pop(tok, None)
+    return bool(item) and item[0] == name and item[1] >= time.monotonic()
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 
 DEFAULT_CONFIG = {
@@ -957,8 +981,27 @@ def list_templates_hint() -> list:
 # ---------------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
+    # 统一网关 Unix Socket：飞牛网关已校验登录，并通过 X-Trim-* 头转发用户；仅管理员可用
+    gateway = False
+
     def log_message(self, fmt, *args):
         pass  # quiet
+
+    def _strip_prefix(self, path: str) -> str:
+        if path == GATEWAY_PREFIX or path.startswith(GATEWAY_PREFIX + "/"):
+            return path[len(GATEWAY_PREFIX):] or "/"
+        return path
+
+    def _gateway_denied(self) -> bool:
+        if not self.gateway or self.headers.get("X-Trim-Isadmin", "").lower() == "true":
+            return False
+        body = "仅飞牛管理员可使用 LXC 管理。".encode("utf-8")
+        self.send_response(403)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return True
 
     def _json(self, code: int, obj):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -970,7 +1013,13 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _same_origin(self) -> bool:
-        """拒绝跨站请求（本服务以 root 运行，防止被网页 CSRF）。"""
+        """拒绝跨站请求（本服务以 root 运行，防止被网页 CSRF）。
+        自定义请求头无法被跨站表单/脚本在不经预检的情况下发送，因此必须带上；
+        直连端口时再额外比对 Origin 与 Host（经网关时 Host 不可靠，只靠自定义头）。"""
+        if self.headers.get(CSRF_HEADER[0]) != CSRF_HEADER[1]:
+            return False
+        if self.gateway:
+            return True
         origin = self.headers.get("Origin")
         if not origin:
             return True
@@ -1010,8 +1059,16 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if self._gateway_denied():
+            return
         u = urlparse(self.path)
-        path = u.path
+        if u.path == GATEWAY_PREFIX:  # 补上结尾斜杠，页面里的相对地址才能解析到网关路径下
+            self.send_response(301)
+            self.send_header("Location", GATEWAY_PREFIX.rsplit("/", 1)[1] + "/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        path = self._strip_prefix(u.path)
 
         mt = re.match(r"^/api/container/([^/]+)/term$", path)
         if mt:
@@ -1023,15 +1080,18 @@ class Handler(BaseHTTPRequestHandler):
         self._serve_static(path)
 
     def do_POST(self):
+        if self._gateway_denied():
+            return
         u = urlparse(self.path)
-        if not u.path.startswith("/api/"):
+        path = self._strip_prefix(u.path)
+        if not path.startswith("/api/"):
             self.send_error(404)
             return
         if not self._same_origin():
             self._json(403, {"ok": False, "error": "cross-origin request refused"})
             return
         body = self._read_json()
-        self.handle_api_post(u.path, body)
+        self.handle_api_post(path, body)
 
     def handle_term(self, name, qs):
         name = clean_name(name)
@@ -1039,8 +1099,8 @@ class Handler(BaseHTTPRequestHandler):
         if not name or not key or "websocket" not in (self.headers.get("Upgrade") or "").lower():
             self._json(400, {"ok": False, "error": "websocket required"})
             return
-        if not self._same_origin():
-            self._json(403, {"ok": False, "error": "cross-origin request refused"})
+        if not consume_term_token((qs.get("token") or [""])[0], name):
+            self._json(403, {"ok": False, "error": "invalid or expired token"})
             return
         if container_state(name) != "RUNNING":
             self._json(409, {"ok": False, "error": "容器未运行"})
@@ -1134,6 +1194,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, create_container(body))
             return
 
+        if path == "/api/container/term-token":
+            name = clean_name(body.get("name", ""))
+            if not name:
+                self._json(400, {"ok": False, "error": "invalid name"})
+                return
+            self._json(200, {"ok": True, "token": issue_term_token(name)})
+            return
+
         if path == "/api/container/autostart":
             self._json(200, set_autostart(body.get("name", ""), body.get("enabled")))
             return
@@ -1221,12 +1289,36 @@ def boot_autostart(wait_total: int = 600) -> None:
         print(f"autostart: still stopped: {', '.join(left)}", flush=True)
 
 
+class GatewayHandler(Handler):
+    gateway = True
+
+
+class UnixHTTPServer(ThreadingHTTPServer):
+    address_family = socket.AF_UNIX
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)  # 跳过 HTTPServer 对 (host, port) 的解包
+        self.server_name = "localhost"
+        self.server_port = 0
+
+
+def make_unix_server(path: str) -> UnixHTTPServer:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    srv = UnixHTTPServer(path, GatewayHandler)
+    os.chmod(path, 0o666)  # 网关进程需要能连接
+    return srv
+
+
 def main():
     global DATA_DIR, CONFIG_FILE
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=9100)
     parser.add_argument("--data-dir", default=str(DATA_DIR))
     parser.add_argument("--bind", default="0.0.0.0")
+    parser.add_argument("--socket", default="", help="统一网关 Unix Socket 路径")
     args = parser.parse_args()
     DATA_DIR = Path(args.data_dir)
     CONFIG_FILE = DATA_DIR / "config.json"
@@ -1235,6 +1327,10 @@ def main():
     threading.Thread(target=boot_autostart, daemon=True).start()
     server = ThreadingHTTPServer((args.bind, args.port), Handler)
     print(f"fnos-lxc listening on {args.bind}:{args.port}, data={DATA_DIR}", flush=True)
+    if args.socket:
+        gw = make_unix_server(args.socket)
+        print(f"fnos-lxc gateway socket {args.socket}", flush=True)
+        threading.Thread(target=gw.serve_forever, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

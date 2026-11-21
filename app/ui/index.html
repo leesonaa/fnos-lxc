@@ -567,8 +567,8 @@
     }
 
     async function api(path, opts = {}) {
-      const r = await fetch(path, {
-        headers: { "Content-Type": "application/json" },
+      const r = await fetch(path.replace(/^\//, ""), {
+        headers: { "Content-Type": "application/json", "X-Requested-With": "fnos-lxc" },
         ...opts,
         body: opts.body ? JSON.stringify(opts.body) : undefined,
       });
@@ -1176,13 +1176,23 @@
     function termSendResize() {
       if (ws && ws.readyState === 1 && term) ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
     }
-    function termConnect() {
+    let termSeq = 0;
+    async function termConnect() {
+      const seq = ++termSeq;
       if (ws) { try { ws.close(); } catch (e) {} }
       cv("term-reconnect").classList.add("hidden");
       cv("term-status").textContent = "连接中…";
       fit.fit();
+      const t = await api("/api/container/term-token", { method: "POST", body: { name: termName } });
+      if (seq !== termSeq) return;
+      if (!t.ok) {
+        cv("term-status").textContent = t.error || "认证失败";
+        cv("term-reconnect").classList.remove("hidden");
+        return;
+      }
       const proto = location.protocol === "https:" ? "wss" : "ws";
-      ws = new WebSocket(`${proto}://${location.host}/api/container/${encodeURIComponent(termName)}/term?cols=${term.cols}&rows=${term.rows}`);
+      const base = new URL(document.baseURI).pathname.replace(/\/$/, "");
+      ws = new WebSocket(`${proto}://${location.host}${base}/api/container/${encodeURIComponent(termName)}/term?token=${encodeURIComponent(t.token)}&cols=${term.cols}&rows=${term.rows}`);
       ws.binaryType = "arraybuffer";
       const mine = ws;
       ws.onopen = () => { cv("term-status").textContent = ""; term.focus(); };

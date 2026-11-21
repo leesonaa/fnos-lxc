@@ -65,7 +65,7 @@ appcenter-cli start fnos-lxc
 | 路径 | 作用 |
 |------|------|
 | `manifest` | 应用元数据，`platform=all` |
-| `cmd/main` | 启停 Python 后端（9100） |
+| `cmd/main` | 启停 Python 后端（统一网关 Unix Socket，9100 仅监听本机） |
 | `app/server/main.py` | API + 初始化 + LXC 封装 |
 | `app/server/lxcconf.py` | 容器 config 解析 / 受管区块写入 |
 | `app/ui/index.html` | 向导 + 列表 + 配置表单 + 终端 |
@@ -78,7 +78,9 @@ appcenter-cli start fnos-lxc
 - 初始化与容器操作需要 **root**（privilege 已声明）
 - 创建容器首次会从 `images.linuxcontainers.org` 拉模板，需能访问外网
 - 快照页可在后续版本加；当前已覆盖：列表 / 启停杀冻 / 创建 / 配置表单 / 终端
-- 服务以 root 监听 9100 且无登录；已拒绝跨站 POST，但局域网内任何人可访问，请勿暴露到公网
+- **访问方式**：通过飞牛[统一网关](https://developer.fnnas.com/docs/core-concepts/gateway-registration)（`/app/fnos-lxc/`）打开，由飞牛校验登录，应用只放行管理员（`X-Trim-Isadmin`）；因此经飞牛反代、穿透访问都可用。9100 端口只监听 `127.0.0.1`，局域网无法直连
+- 所有写操作需带自定义请求头（防跨站请求），终端 WebSocket 使用一次性 30 秒令牌
+- Unix Socket 权限为 0666（网关进程需要连接），本机其他有 shell 的用户理论上可伪造网关头，请只给可信用户 SSH 权限
 - 若 apt 安装在向导里失败，可 SSH：`apt-get install -y lxc lxc-templates lxcfs bridge-utils debootstrap uidmap` 后继续向导
 
 ## 本地调试后端

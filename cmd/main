@@ -7,6 +7,7 @@ DATA_DIR="${TRIM_PKGVAR:-/vol1/@appdata/${APP_NAME}}"
 PID_FILE="${DATA_DIR}/server.pid"
 LOG_FILE="${DATA_DIR}/server.log"
 SERVER="${APP_DIR}/server/main.py"
+SOCK="${APP_DIR}/app.sock"
 PORT=9100
 
 mkdir -p "${DATA_DIR}"
@@ -21,7 +22,7 @@ start() {
     echo "python3 not found" >> "${TRIM_TEMP_LOGFILE:-/dev/stderr}"
     return 1
   fi
-  nohup python3 "${SERVER}" --port "${PORT}" --data-dir "${DATA_DIR}" >> "${LOG_FILE}" 2>&1 &
+  nohup python3 "${SERVER}" --port "${PORT}" --bind 127.0.0.1 --socket "${SOCK}" --data-dir "${DATA_DIR}" >> "${LOG_FILE}" 2>&1 &
   echo $! > "${PID_FILE}"
   sleep 1
   if ! kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
@@ -42,6 +43,7 @@ stop() {
     fi
     rm -f "${PID_FILE}"
   fi
+  rm -f "${SOCK}"
   # fallback
   pkill -f "python3 .*${APP_NAME}/.*main.py" 2>/dev/null || true
   echo "stopped ${APP_NAME}"
