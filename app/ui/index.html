@@ -364,11 +364,11 @@
                 <th class="c">状态</th>
                 <th class="c">CPU</th>
                 <th class="c">内存</th>
-                <th>地址</th>
+                <th class="c">地址</th>
                 <th class="c">已用流量</th>
                 <th class="c">自启</th>
                 <th class="c">已运行</th>
-                <th>操作</th>
+                <th class="c">操作</th>
               </tr>
             </thead>
             <tbody id="ct-body">
@@ -658,23 +658,24 @@
 
     const fmtBytes = (n) => {
       if (n == null) return "-";
-      const u = ["B", "KiB", "MiB", "GiB", "TiB"];
+      const u = ["B", "K", "M", "G", "T"];
       let i = 0;
       while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
-      return (i === 0 ? n : n.toFixed(n >= 100 ? 0 : 2)) + " " + u[i];
+      const v = n >= 10 || i === 0 ? Math.round(n) : n.toFixed(1).replace(/\.0$/, "");
+      return v + u[i];
     };
     const fmtUptime = (sec) => {
       if (sec == null) return "-";
-      if (sec >= 86400) return Math.floor(sec / 86400) + " 天 " + Math.floor(sec % 86400 / 3600) + " 时";
-      if (sec >= 3600) return Math.floor(sec / 3600) + " 时 " + Math.floor(sec % 3600 / 60) + " 分";
-      if (sec >= 60) return Math.floor(sec / 60) + " 分钟";
-      return sec + " 秒";
+      if (sec >= 86400) return Math.floor(sec / 86400) + "d " + Math.floor(sec % 86400 / 3600) + "h";
+      if (sec >= 3600) return Math.floor(sec / 3600) + "h " + Math.floor(sec % 3600 / 60) + "m";
+      if (sec >= 60) return Math.floor(sec / 60) + "m";
+      return sec + "s";
     };
     const statCpu = (c) => c.stats ? `${c.stats.cpu == null ? "-" : c.stats.cpu + "%"}<small>核 ${esc(c.stats.cpus)}</small>` : "-";
     const statMem = (c) => {
       const t = c.stats;
       if (!t || t.mem == null) return "-";
-      return `${fmtBytes(t.mem)}<small>/ ${t.mem_max ? fmtBytes(t.mem_max) : "不限"}</small>`;
+      return `${fmtBytes(t.mem)}/${t.mem_max ? fmtBytes(t.mem_max) : "不限"}`;
     };
     const statNet = (c) => c.stats && c.stats.rx != null ? `↓ ${fmtBytes(c.stats.rx)}<small>↑ ${fmtBytes(c.stats.tx)}</small>` : "-";
     const statUp = (c) => c.stats ? `${fmtUptime(c.stats.uptime)}<small>PID ${c.stats.pid}</small>` : "-";
@@ -712,11 +713,11 @@
           <td class="c">${stateBadge(c.state)}</td>
           <td class="stat c" data-k="cpu">${statCpu(c)}</td>
           <td class="stat c" data-k="mem">${statMem(c)}</td>
-          <td>${addrCell(c)}</td>
+          <td class="c">${addrCell(c)}</td>
           <td class="stat c" data-k="net">${statNet(c)}</td>
           <td class="c">${sw}</td>
           <td class="stat c" data-k="up">${statUp(c)}</td>
-          <td class="actions">${btns()}</td>
+          <td class="actions c">${btns()}</td>
         </tr>`;
     }
 
