@@ -531,7 +531,7 @@
           <label class="check"><input type="checkbox" id="c-tun" /><span>TUN/TAP 设备<small>VPN 类应用需要：Tailscale、WireGuard、OpenVPN、sing-box 等</small></span></label>
           <label class="check"><input type="checkbox" id="c-fuse" /><span>FUSE 设备<small>rclone mount、sshfs、alist 挂载等</small></span></label>
           <label class="check"><input type="checkbox" id="c-gpu" /><span>核显/GPU 直通（/dev/dri）<small>Jellyfin / Plex 硬件转码</small></span></label>
-          <label class="check"><input type="checkbox" id="c-docker" /><span>支持在容器内运行 Docker / 嵌套容器<small>关闭 AppArmor 限制并放开设备与能力，容器隔离性会降低</small></span></label>
+          <label class="check"><input type="checkbox" id="c-docker" /><span>支持在容器内运行 Docker / 嵌套容器<small style="color:#c0392b">⚠ 高风险：将关闭 AppArmor、放开全部设备访问并保留所有 capability，容器几乎等同于特权容器，存在逃逸风险。仅在确实需要时开启。</small></span></label>
         </fieldset>
 
         <fieldset>
@@ -919,10 +919,12 @@
     }, 4000);
 
     async function onAction(name, action, btn) {
-      if (action === "destroy" && !confirm(`确认删除容器 ${name}？不可恢复。`)) return;
+      if (action === "destroy" && !confirm(`确认删除容器 ${name}？此操作不可恢复。`)) return;
       if (btn) btn.disabled = true;
       toast(`${action} ${name}…`);
-      const r = await api("/api/container/action", { method: "POST", body: { name, action } });
+      const body = { name, action };
+      if (action === "destroy") body.confirm = true;
+      const r = await api("/api/container/action", { method: "POST", body });
       if (!r.ok) toast(r.error || r.detail?.stderr || "失败");
       else toast("完成");
       loadContainers();
@@ -1241,6 +1243,7 @@
     async function saveConfig(restart) {
       const r = await api(`/api/container/${encodeURIComponent(cfgName)}/settings`, { method: "POST", body: collectForm() });
       if (!r.ok) { toast(r.error || "保存失败"); return; }
+      if (r.warning) toast(r.warning);
       if (restart) {
         toast("已保存，正在重启…");
         await api("/api/container/action", { method: "POST", body: { name: cfgName, action: "stop" } });

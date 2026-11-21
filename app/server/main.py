@@ -91,15 +91,19 @@ def save_config(cfg: dict) -> None:
 # Shell helpers
 # ---------------------------------------------------------------------------
 
-def run(cmd, timeout=120, input_text=None):
+def run(cmd, timeout=120, input_text=None, env=None):
+    """Run a command. *cmd* must be a list of arguments (shell=False always)."""
+    if isinstance(cmd, str):
+        raise TypeError("run() only accepts a list of arguments, not a shell string")
     try:
         r = subprocess.run(
             cmd,
-            shell=isinstance(cmd, str),
+            shell=False,
             capture_output=True,
             text=True,
             timeout=timeout,
             input=input_text,
+            env=env,
         )
         return {
             "ok": r.returncode == 0,
@@ -143,7 +147,7 @@ def detect_bridges() -> list:
     """列出可用网桥：OVS 桥 + Linux 桥，*-ovs 排最前；每次调用实时探测。"""
     found = []
     if which("ovs-vsctl"):
-        r = run("ovs-vsctl list-br", timeout=10)
+        r = run(["ovs-vsctl", "list-br"], timeout=10)
         if r["ok"]:
             found += [x.strip() for x in r["stdout"].splitlines() if x.strip()]
     try:
@@ -219,16 +223,20 @@ def step_install_packages() -> dict:
         "uidmap",
     ]
     # noninteractive; keep existing conf if we already wrote default.conf
-    env_cmd = (
-        "DEBIAN_FRONTEND=noninteractive apt-get install -y "
-        "-o Dpkg::Options::=--force-confdef "
-        "-o Dpkg::Options::=--force-confold "
-        + " ".join(pkgs)
-    )
-    r = run("DEBIAN_FRONTEND=noninteractive apt-get update -qq", timeout=180)
+    apt_env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+    r = run(["apt-get", "update", "-qq"], timeout=180, env=apt_env)
     if not r["ok"]:
         return {"ok": False, "step": "apt-update", "detail": r, "has_lxc": False}
-    r2 = run(env_cmd, timeout=600)
+    r2 = run(
+        [
+            "apt-get", "install", "-y",
+            "-o", "Dpkg::Options::=--force-confdef",
+            "-o", "Dpkg::Options::=--force-confold",
+            *pkgs,
+        ],
+        timeout=600,
+        env=apt_env,
+    )
     ok = which("lxc-ls") and which("lxc-create")
     if not r2["ok"] and not ok:
         return {"ok": False, "step": "apt-install", "detail": r2, "has_lxc": False}
@@ -616,10 +624,12 @@ def container_state(name: str) -> str:
     return r["stdout"].strip().upper() if r["ok"] else "UNKNOWN"
 
 
-def container_action(name: str, action: str) -> dict:
+def container_action(name: str, action: str, confirm: bool = False) -> dict:
     name = clean_name(name)
     if not name:
         return {"ok": False, "error": "invalid name"}
+    if action == "destroy" and not confirm:
+        return {"ok": False, "error": "删除容器需要 confirm=true 二次确认"}
     t = str(int(load_config().get("timeout", 15)))
     mapping = {
         "start": ["lxc-start", "-n", name, "-d"],
@@ -641,10 +651,10 @@ def container_action(name: str, action: str) -> dict:
 
 
 def host_arch() -> str:
-    a = run("dpkg --print-architecture").get("stdout", "")
+    a = run(["dpkg", "--print-architecture"]).get("stdout", "")
     if a:
         return a
-    return {"x86_64": "amd64", "aarch64": "arm64"}.get(run("uname -m").get("stdout", ""), "amd64")
+    return {"x86_64": "amd64", "aarch64": "arm64"}.get(run(["uname", "-m"]).get("stdout", ""), "amd64")
 
 
 # ----- 创建容器（后台任务 + 进度） -----
@@ -855,9 +865,13 @@ def get_job(jid: str) -> dict:
 def _prepare_host_devices(s: dict) -> None:
     """TUN / FUSE 需要宿主机有对应设备节点。"""
     if s.get("tun"):
-        run("modprobe tun 2>/dev/null; mkdir -p /dev/net; [ -e /dev/net/tun ] || mknod /dev/net/tun c 10 200; chmod 666 /dev/net/tun")
+        run(["modprobe", "tun"], timeout=10)
+        Path("/dev/net").mkdir(parents=True, exist_ok=True)
+        if not Path("/dev/net/tun").exists():
+            run(["mknod", "/dev/net/tun", "c", "10", "200"], timeout=5)
+            run(["chmod", "666", "/dev/net/tun"], timeout=5)
     if s.get("fuse"):
-        run("modprobe fuse 2>/dev/null")
+        run(["modprobe", "fuse"], timeout=10)
 
 
 def get_container_settings(name: str) -> dict:
@@ -902,7 +916,13 @@ def save_container_settings(name: str, raw: dict, check_mounts: bool = True) -> 
         _atomic_write(p, new)
     _sync_guest_net(p, new)
     _prepare_host_devices(s)
-    return {"ok": True, "needs_restart": container_state(name) in ("RUNNING", "FROZEN")}
+    out = {"ok": True, "needs_restart": container_state(name) in ("RUNNING", "FROZEN")}
+    if s.get("docker"):
+        out["warning"] = (
+            "已开启 Docker/嵌套容器支持：AppArmor 已关闭、设备与 capability 全部放开，"
+            "容器隔离性显著降低，仅在确实需要时使用。"
+        )
+    return out
 
 
 def _sync_guest_net(p: Path, conf_text: str) -> None:
@@ -1435,7 +1455,14 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/container/action":
-            self._json(200, container_action(body.get("name", ""), body.get("action", "")))
+            self._json(
+                200,
+                container_action(
+                    body.get("name", ""),
+                    body.get("action", ""),
+                    confirm=bool(body.get("confirm")),
+                ),
+            )
             return
 
         m = re.match(r"^/api/container/([^/]+)/(settings|config)$", path)
