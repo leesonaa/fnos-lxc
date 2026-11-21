@@ -222,6 +222,10 @@
     .term-box .xterm-viewport::-webkit-scrollbar-thumb { background: #3a4150; border-radius: 4px; }
     .term-box .xterm { padding: 6px 12px 6px 6px; }
     .stat { white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .kv { display: inline-grid; grid-template-columns: auto auto; gap: 0 6px; text-align: left; justify-content: center; line-height: 1.5; }
+    .kv i { font-style: normal; color: var(--muted); }
+    .kv b { font-weight: 400; }
+    .kv b.tx { color: var(--muted); }
     .stat small, td small { display: block; color: var(--muted); font-size: 11px; }
     td.actions { white-space: nowrap; }
     th.c, td.c { text-align: center; }
@@ -675,9 +679,12 @@
     const statMem = (c) => {
       const t = c.stats;
       if (!t || t.mem == null) return "-";
-      return `${fmtBytes(t.mem)}/${t.mem_max ? fmtBytes(t.mem_max) : "不限"}`;
+      const pct = t.mem_max ? t.mem / t.mem_max * 100 : null;
+      const pctText = pct == null ? "不限" : (pct >= 10 ? Math.round(pct) : pct.toFixed(1)) + "%";
+      return `${fmtBytes(t.mem)}/${t.mem_max ? fmtBytes(t.mem_max) : "∞"}<small>${pctText}</small>`;
     };
-    const statNet = (c) => c.stats && c.stats.rx != null ? `↓ ${fmtBytes(c.stats.rx)}<small>↑ ${fmtBytes(c.stats.tx)}</small>` : "-";
+    const statNet = (c) => c.stats && c.stats.rx != null
+      ? `<span class="kv"><i>↓</i><b>${fmtBytes(c.stats.rx)}</b><i>↑</i><b class="tx">${fmtBytes(c.stats.tx)}</b></span>` : "-";
     const statUp = (c) => c.stats ? `${fmtUptime(c.stats.uptime)}<small>PID ${c.stats.pid}</small>` : "-";
     const STAT_CELLS = { cpu: statCpu, mem: statMem, net: statNet, up: statUp };
 
