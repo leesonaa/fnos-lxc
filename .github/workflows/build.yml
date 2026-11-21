@@ -49,7 +49,7 @@ jobs:
             OUT="fnos-lxc-${VERSION}.fpk"
             echo "signed=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::未配置 FNOS_DEV_KEY / FNOS_DEV_CERT，生成的是未签名包（仅供调试，不会发布 Release）"
+            echo "::warning::未配置 FNOS_DEV_KEY / FNOS_DEV_CERT，生成的是未签名包"
             fnpack build --nosign
             OUT="fnos-lxc-${VERSION}-unsigned.fpk"
             echo "signed=false" >> "$GITHUB_OUTPUT"
@@ -65,7 +65,7 @@ jobs:
           path: dist/*.fpk
 
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v') && steps.build.outputs.signed == 'true'
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ steps.build.outputs.file }}

@@ -47,7 +47,7 @@ fnpack build
 - `FNOS_DEV_KEY`：开发者私钥（PEM 全文）
 - `FNOS_DEV_CERT`：开发者证书（PEM 全文）
 
-未配置时只产出 `-unsigned.fpk`（仅供调试，不会发布 Release）。本地调试可用 `fnpack build --nosign`。
+未配置时产出 `-unsigned.fpk`（同样会发布到 Release，文件名带 `-unsigned`）。本地调试可用 `fnpack build --nosign`。
 
 安装到飞牛：
 

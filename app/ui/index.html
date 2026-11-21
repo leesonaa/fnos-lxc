@@ -147,6 +147,11 @@
     .modal.term { width: min(1000px, 96vw); height: min(640px, 90vh); display: flex; flex-direction: column; padding: 14px; background: #0a0b0d; }
     .term-box { flex: 1; min-height: 0; padding: 6px; background: #0a0b0d; border-radius: 6px; overflow: hidden; }
     .term-box .xterm { height: 100%; }
+    .term-box .xterm-viewport { background-color: transparent !important; scrollbar-width: thin; scrollbar-color: #3a4150 transparent; }
+    .term-box .xterm-viewport::-webkit-scrollbar { width: 8px; }
+    .term-box .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
+    .term-box .xterm-viewport::-webkit-scrollbar-thumb { background: #3a4150; border-radius: 4px; }
+    .term-box .xterm { padding: 0 12px 0 4px; }
     .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
     .tab {
       padding: 8px 14px; cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent;
@@ -940,7 +945,7 @@
       if (ro) ro.disconnect();
       ro = new ResizeObserver(() => { try { fit.fit(); } catch (e) {} });
       ro.observe(cv("term-box"));
-      termConnect();
+      requestAnimationFrame(() => { try { fit.fit(); } catch (e) {} termConnect(); });
     }
     cv("term-reconnect").onclick = termConnect;
     cv("term-close").onclick = () => {
