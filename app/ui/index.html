@@ -251,7 +251,7 @@
     .ct-row > label { width: 34px; margin: 0; flex: none; color: var(--muted); font-size: 12px; }
     .ct-row > span { white-space: nowrap; }
     .ct-row > .pb { min-width: 60px; }
-    .ct-row > .pb + .mut { min-width: 92px; text-align: right; }
+    .ct-row > .pb + .mut { min-width: 78px; text-align: right; }
     .ct-row .mut { color: var(--muted); }
     .ct-row .ips { display: flex; flex-direction: column; min-width: 0; }
     .pb { position: relative; flex: 1; height: 20px; border-radius: 4px; background: var(--pbar-bg); overflow: hidden; }
@@ -703,7 +703,9 @@
     const statCpu = (c) => {
       if (!c.stats) return "-";
       const v = c.stats.cpu;
-      return `<b>${v == null ? "-" : fmtPct(v)}</b>${meter(v)}<small>核 ${esc(c.stats.cpus)}</small>`;
+      const quota = c.stats.cpu_limit;
+      const label = quota ? `限额 ${quota === 1 ? "1" : Number(quota.toFixed(2))} 核` : `可调度 ${esc(c.stats.cpus)}`;
+      return `<b>${v == null ? "-" : fmtPct(v)}</b>${meter(v)}<small>${label}</small>`;
     };
     const statMem = (c) => {
       const t = c.stats;
@@ -769,7 +771,10 @@
     function cardRows(c) {
       const t = c.stats;
       const running = !!t;
-      const cpu = running ? pbar(t.cpu, t.cpu == null ? "-" : fmtPct(t.cpu), `${t.cpus ? "核 " + esc(t.cpus) : ""}`) : pbar(null);
+      const cpuLabel = t && t.cpu_limit
+        ? `限额 ${t.cpu_limit === 1 ? "1" : Number(t.cpu_limit.toFixed(2))} 核`
+        : (t && t.cpus ? `调度 ${esc(t.cpus)}` : "");
+      const cpu = running ? pbar(t.cpu, t.cpu == null ? "-" : fmtPct(t.cpu), cpuLabel) : pbar(null);
       let mem = pbar(null);
       if (running && t.mem != null) {
         const pct = t.mem_max ? t.mem / t.mem_max * 100 : 0;

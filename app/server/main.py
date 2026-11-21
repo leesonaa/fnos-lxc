@@ -382,9 +382,21 @@ def _uptime_s(pid: int):
         return None
 
 
-def container_stats(name: str, pid: int, mem_limit_mb: int = 0) -> dict:
-    ncpu = os.cpu_count() or 1
-    st = {"pid": pid, "cpus": f"0-{ncpu - 1}" if ncpu > 1 else "0", "cpu": None,
+def _cpuset_count(value: str) -> int:
+    count = 0
+    try:
+        for item in value.split(","):
+            a, sep, b = item.partition("-")
+            count += int(b) - int(a) + 1 if sep else 1
+    except ValueError:
+        return 0
+    return count
+
+
+def container_stats(name: str, pid: int, mem_limit_mb: int = 0, cpu_limit_cores: float = 0) -> dict:
+    host_cpus = os.cpu_count() or 1
+    st = {"pid": pid, "cpus": f"0-{host_cpus - 1}" if host_cpus > 1 else "0", "cpu": None,
+          "cpu_limit": cpu_limit_cores or None,
           "mem": None, "mem_max": None, "rx": None, "tx": None, "uptime": _uptime_s(pid)}
     st["rx"], st["tx"] = _net_bytes(pid)
     st["rx_rate"] = st["tx_rate"] = None
@@ -402,10 +414,22 @@ def container_stats(name: str, pid: int, mem_limit_mb: int = 0) -> dict:
     d = _cgroup_dir(pid, name)
     if not d:
         return st
+    capacity = _cpuset_count(st["cpus"]) or host_cpus
+    try:
+        cpu_max = (d / "cpu.max").read_text().split()
+        if len(cpu_max) >= 2 and cpu_max[0] != "max" and int(cpu_max[1]) > 0:
+            st["cpu_limit"] = int(cpu_max[0]) / int(cpu_max[1])
+    except (OSError, ValueError):
+        pass
+    if st["cpu_limit"]:
+        capacity = min(capacity, st["cpu_limit"])
     try:
         eff = (d / "cpuset.cpus.effective").read_text().strip()
         if eff:
             st["cpus"] = eff
+            capacity = _cpuset_count(eff) or capacity
+            if st["cpu_limit"]:
+                capacity = min(capacity, st["cpu_limit"])
     except OSError:
         pass
     st["mem"] = _read_int(d / "memory.current")
@@ -422,7 +446,7 @@ def container_stats(name: str, pid: int, mem_limit_mb: int = 0) -> dict:
         prev = _CPU_PREV.get(name)
         _CPU_PREV[name] = (now, usage)
     if prev and now > prev[0] and usage >= prev[1]:
-        st["cpu"] = round(min(100.0, (usage - prev[1]) / 1e6 / (now - prev[0]) / ncpu * 100), 1)
+        st["cpu"] = round(min(100.0, (usage - prev[1]) / 1e6 / (now - prev[0]) / max(capacity, 0.01) * 100), 1)
     return st
 
 
@@ -461,10 +485,12 @@ def list_containers() -> list:
         c["distro"], c["release"] = detect_distro(c["name"])
         p = ct_config_path(c["name"])
         mem_mb = 0
+        cpu_cores = 0
         try:
             cs = lxcconf.parse_settings(p.read_text(errors="ignore")) if p else {}
             c["webui"] = cs.get("webui", "")
             mem_mb = cs.get("memory_mb", 0)
+            cpu_cores = cs.get("cpu_cores", 0)
             if p:  # 运行中的容器 lxc-ls 返回的是启动时加载的配置，以磁盘上的 config 为准
                 c["autostart"] = bool(cs.get("autostart"))
         except OSError:
@@ -472,7 +498,7 @@ def list_containers() -> list:
         if running and not c["pid"]:
             r = run(["lxc-info", "-n", c["name"], "-pH"], timeout=10)
             c["pid"] = int(r["stdout"]) if r["ok"] and r["stdout"].isdigit() else 0
-        c["stats"] = container_stats(c["name"], c["pid"], mem_mb) if running and c["pid"] else None
+        c["stats"] = container_stats(c["name"], c["pid"], mem_mb, cpu_cores) if running and c["pid"] else None
         return c
 
     with ThreadPoolExecutor(max_workers=8) as ex:
