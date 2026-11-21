@@ -1028,6 +1028,58 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
 
+def _boot_id() -> str:
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return ""
+
+
+def _autostart_pending() -> list:
+    return [c["name"] for c in list_containers() if c["autostart"] and c["state"] != "RUNNING"]
+
+
+def boot_autostart(wait_total: int = 600) -> None:
+    """每次开机只执行一次：等数据卷和网桥就绪后，启动所有 lxc.start.auto=1 的容器。"""
+    boot = _boot_id()
+    marker = DATA_DIR / "autostart.boot"
+    try:
+        if boot and marker.read_text().strip() == boot:
+            return
+    except OSError:
+        pass
+    waited = 0
+    while waited < wait_total:
+        cfg = load_config()
+        if cfg.get("initialized") and cfg.get("lxcpath") and Path(cfg["lxcpath"]).is_dir():
+            bridge = cfg.get("bridge")
+            if not bridge or (SYS_NET / bridge).exists():
+                break
+        threading.Event().wait(5)
+        waited += 5
+    else:
+        print("autostart: lxcpath/bridge not ready, skipped", flush=True)
+        return
+    if boot:
+        try:
+            marker.write_text(boot)
+        except OSError:
+            pass
+    if not which("lxc-autostart"):
+        return
+    for attempt in range(3):
+        if not _autostart_pending():
+            break
+        print(f"autostart: lxc-autostart (attempt {attempt + 1})", flush=True)
+        r = run(["lxc-autostart", "-P", lxc_base().as_posix()], timeout=3600)
+        if not r["ok"]:
+            print(f"autostart: {r['stderr']}", flush=True)
+        threading.Event().wait(5)
+    left = _autostart_pending()
+    if left:
+        print(f"autostart: still stopped: {', '.join(left)}", flush=True)
+
+
 def main():
     global DATA_DIR, CONFIG_FILE
     parser = argparse.ArgumentParser()
@@ -1039,6 +1091,7 @@ def main():
     CONFIG_FILE = DATA_DIR / "config.json"
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+    threading.Thread(target=boot_autostart, daemon=True).start()
     server = ThreadingHTTPServer((args.bind, args.port), Handler)
     print(f"fnos-lxc listening on {args.bind}:{args.port}, data={DATA_DIR}", flush=True)
     try:

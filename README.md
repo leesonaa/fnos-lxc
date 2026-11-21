@@ -20,6 +20,8 @@ TUN/TAP、FUSE、GPU 直通（/dev/dri）、Docker 嵌套、目录挂载；另�
 表单项写入 config 末尾的受管区块（`# >>> fnos-lxc managed >>>`），每次保存前备份为 `config.fnos-bak`。
 IPv4 设为静态时，会同时关闭容器内 eth0 的 DHCP（ifupdown / systemd-networkd / netplan，原文件备份为 `*.fnos-orig`，改回 DHCP 自动还原），避免出现额外的自动分配地址；保存后需重启容器生效。
 
+**开机自启**：飞牛开机后本应用启动时，会等待数据卷目录和所选网桥就绪（最多 10 分钟），再对勾选了「开机自启」的容器执行一次 `lxc-autostart`（失败自动重试，每次开机只执行一次，日志见 `server.log`）。不依赖系统的 `lxc.service`。
+
 ## 终端
 
 容器运行时点「终端」：真正的交互式终端（xterm.js + PTY + WebSocket，经 `lxc-attach`），
