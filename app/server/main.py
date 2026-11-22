@@ -28,6 +28,7 @@ from urllib.parse import parse_qs, urlparse
 
 import guestnet
 import lxcconf
+import oplog
 
 # ---------------------------------------------------------------------------
 # Paths & config
@@ -205,6 +206,7 @@ def start_install_job() -> dict:
             err = f"{res.get('step', '')}: {(d.get('stderr') or d.get('stdout') or '').splitlines()[-1:] or ['失败']}"[:300]
         _job_set(job, status="done" if res.get("ok") else "error", progress=100, result=res, error=err,
                  elapsed=int(time.time() - t0))
+        oplog.log("setup.install_packages", ok=bool(res.get("ok")), detail=err or "ok")
 
     threading.Thread(target=work, daemon=True).start()
     return {"ok": True, "job": jid}
@@ -346,6 +348,7 @@ def finalize_init(lxcpath: str, bridge: str, timeout: int = 15) -> dict:
         }
     )
     save_config(cfg)
+    oplog.log("setup.finalize", ok=True, detail=f"lxcpath={cfg.get('lxcpath')} bridge={cfg.get('bridge')}")
     return {"ok": True, "config": cfg, "warning": r1.get("warning", "")}
 
 
@@ -616,7 +619,9 @@ def set_autostart(name: str, enabled: bool) -> dict:
     if not s["bridge"]:
         s["bridge"] = load_config().get("bridge") or "br0"
     s["autostart"] = bool(enabled)
-    return save_container_settings(name, s, check_mounts=False)
+    r = save_container_settings(name, s, check_mounts=False)
+    oplog.log("container.autostart", ok=bool(r.get("ok")), name=name, detail="" if r.get("ok") else r.get("error", ""), enabled=bool(enabled))
+    return r
 
 
 def container_state(name: str) -> str:
@@ -647,7 +652,9 @@ def container_action(name: str, action: str, confirm: bool = False) -> dict:
             _sync_guest_net(p, p.read_text(errors="ignore"))
     r = run(mapping[action], timeout=180)
     err = r["stderr"].splitlines()[-1] if r["stderr"] else ""
-    return {"ok": r["ok"], "error": "" if r["ok"] else err, "detail": r}
+    ok = r["ok"]
+    oplog.log("container." + action, ok=ok, name=name, detail="" if ok else (err or r.get("stderr") or r.get("stdout") or f"exit={r.get('code')}"))
+    return {"ok": ok, "error": "" if ok else err, "detail": r}
 
 
 # ----- 快照 -----
@@ -775,11 +782,13 @@ def _snapshot_worker(job: dict, name: str, op: str, snap: str, comment: str, fre
 
             if r["ok"]:
                 _job_set(job, status="done", progress=100, stage="完成")
+                oplog.log("snapshot.create", ok=True, name=name, detail=comment or "")
             else:
                 msg = _snap_err(r)
                 if was_running:
                     msg = f"快照失败。详情: {msg}"
                 _job_set(job, status="error", error=msg[:500])
+                oplog.log("snapshot.create", ok=False, name=name, detail=msg[:500])
             return
 
         elif op == "restore":
@@ -812,8 +821,17 @@ def _snapshot_worker(job: dict, name: str, op: str, snap: str, comment: str, fre
             r = run(["lxc-snapshot", "-n", name, "-d", snap], timeout=600)
         if r["ok"]:
             _job_set(job, status="done", progress=100, stage="完成")
+            if op == "restore":
+                oplog.log("snapshot.restore" if not as_new else "snapshot.clone", ok=True, name=name, snap=snap, as_new=as_new or "")
+            elif op == "delete":
+                oplog.log("snapshot.delete", ok=True, name=name, snap=snap)
         else:
-            _job_set(job, status="error", error=_snap_err(r)[:500])
+            err = _snap_err(r)[:500]
+            _job_set(job, status="error", error=err)
+            if op == "restore":
+                oplog.log("snapshot.restore" if not as_new else "snapshot.clone", ok=False, name=name, snap=snap, detail=err, as_new=as_new or "")
+            elif op == "delete":
+                oplog.log("snapshot.delete", ok=False, name=name, snap=snap, detail=err)
     finally:
         if stopped_by_us and was_running:
             run(["lxc-start", "-n", name, "-d"], timeout=120)
@@ -987,6 +1005,7 @@ def _create_worker(job: dict, name: str, distro: str, release: str, arch: str, a
         proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     except OSError as e:
         _job_set(job, status="error", error=f"无法执行 lxc-create：{e}")
+        oplog.log("container.create", ok=False, name=name, detail=str(e), distro=distro, release=release)
         return
 
     def reader():
@@ -1031,6 +1050,7 @@ def _create_worker(job: dict, name: str, distro: str, release: str, arch: str, a
     if proc.returncode != 0:
         tail = job["log"][-1] if job["log"] else ""
         _job_set(job, status="error", error="lxc-create 失败：" + tail)
+        oplog.log("container.create", ok=False, name=name, detail="lxc-create 失败：" + tail, distro=distro, release=release)
         return
 
     p = ct_config_path(name)
@@ -1041,6 +1061,7 @@ def _create_worker(job: dict, name: str, distro: str, release: str, arch: str, a
         s["bridge"] = s["bridge"] or load_config().get("bridge") or "br0"
         _atomic_write(p, lxcconf.apply_settings(text, s))
     _job_set(job, status="done", progress=100, stage="完成")
+    oplog.log("container.create", ok=True, name=name, distro=distro, release=release, arch=arch)
 
 
 def create_container(body: dict) -> dict:
@@ -1069,6 +1090,7 @@ def create_container(body: dict) -> dict:
     threading.Thread(
         target=_create_worker, args=(job, name, distro, release, arch, bool(body.get("autostart")), mid), daemon=True
     ).start()
+    oplog.log("container.create.start", ok=True, name=name, distro=distro, release=release, arch=arch, mirror=mid)
     return {"ok": True, "job": jid, "name": name}
 
 
@@ -1121,6 +1143,7 @@ def save_container_settings(name: str, raw: dict, check_mounts: bool = True) -> 
         return {"ok": False, "error": "容器不存在"}
     s, err = lxcconf.validate(raw)
     if err:
+        oplog.log("container.settings", ok=False, name=name, detail=err)
         return {"ok": False, "error": err}
     for m in s["mounts"] if check_mounts else []:
         if "optional" in m.get("options", []):
@@ -1140,6 +1163,7 @@ def save_container_settings(name: str, raw: dict, check_mounts: bool = True) -> 
             "已开启 Docker/嵌套容器支持：AppArmor 已关闭、设备与 capability 全部放开，"
             "容器隔离性显著降低，仅在确实需要时使用。"
         )
+    oplog.log("container.settings", ok=True, name=name)
     return out
 
 
@@ -1169,6 +1193,7 @@ def save_container_raw(name: str, text: str) -> dict:
     if "\0" in text or len(text) > 256 * 1024:
         return {"ok": False, "error": "配置内容无效或过大"}
     if not any(k == "lxc.rootfs.path" and v for k, v in lxcconf.kv_effective(text)):
+        oplog.log("container.raw_config", ok=False, name=name, detail="缺少 lxc.rootfs.path")
         return {"ok": False, "error": "配置中缺少有效的 lxc.rootfs.path（注释行不算），已拒绝保存"}
     with _CONF_LOCK:
         (p.parent / "config.fnos-bak").write_text(p.read_text(errors="ignore"))
@@ -1422,6 +1447,7 @@ class Handler(BaseHTTPRequestHandler):
                 allowed.add(x)
         if uid not in allowed:
             print(f"[auth] rejected socket peer uid={uid}; add it to allowed_uids in {CONFIG_FILE} if it is the gateway", flush=True)
+            oplog.log("auth.reject", ok=False, detail=f"peer uid={uid}")
             msg = f"拒绝访问：连接进程 uid={uid} 不受信任。".encode("utf-8")
             self.send_response(403)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -1587,6 +1613,14 @@ class Handler(BaseHTTPRequestHandler):
     def handle_api_get(self, path, qs):
         cfg = load_config()
 
+        if path == "/api/logs":
+            try:
+                n = int((qs.get("limit") or ["200"])[0])
+            except ValueError:
+                n = 200
+            self._json(200, {"ok": True, "logs": oplog.read_tail(n)})
+            return
+
         if path == "/api/status":
             self._json(
                 200,
@@ -1702,7 +1736,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, save_container_raw(name, str(body.get("config", ""))))
             return
 
+        if path == "/api/logs/clear":
+            oplog.clear()
+            oplog.log("logs.clear", ok=True)
+            self._json(200, {"ok": True})
+            return
+
         if path == "/api/config/save":
+
             cfg = load_config()
             if "bridge" in body:
                 if body["bridge"] and not lxcconf.valid_bridge(body["bridge"]):
@@ -1819,6 +1860,8 @@ def main():
     DATA_DIR = Path(args.data_dir)
     CONFIG_FILE = DATA_DIR / "config.json"
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    oplog.init(DATA_DIR)
+    oplog.log("server.start", ok=True, detail=f"data={DATA_DIR}")
 
     threading.Thread(target=boot_autostart, daemon=True).start()
     # 指定 --socket 时只走飞牛统一网关（由网关校验登录），不再开放任何 TCP 端口

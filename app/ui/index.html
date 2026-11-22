@@ -433,6 +433,16 @@
           </div>
           <button class="primary" id="btn-save-settings">保存</button>
         </div>
+        <div class="card" style="margin-top:16px">
+          <div class="row" style="margin-bottom:8px">
+            <strong>操作日志</strong>
+            <div class="spacer"></div>
+            <button id="btn-log-refresh">刷新</button>
+            <button id="btn-log-clear">清空</button>
+          </div>
+          <p class="hint" style="margin-top:0">记录启停、创建、快照、配置等操作的成功与失败，文件在数据目录 ops.log。</p>
+          <pre id="ops-log" class="log" style="max-height:320px;overflow:auto;font-size:12px;margin:0"></pre>
+        </div>
       </div>
     </div>
   </div>
@@ -1237,10 +1247,33 @@
         $("#tab-settings").classList.toggle("hidden", name !== "settings");
       };
     });
+    
+    async function loadOpsLog() {
+      const r = await api("/api/logs?limit=200");
+      const el = $("#ops-log");
+      if (!el) return;
+      if (!r.ok) { el.textContent = r.error || "读取失败"; return; }
+      const lines = (r.logs || []).map((x) => {
+        const flag = x.ok ? "OK" : "FAIL";
+        const name = x.name ? ` [${x.name}]` : "";
+        const detail = x.detail ? ` — ${x.detail}` : "";
+        return `${x.ts || ""} ${flag} ${x.action || ""}${name}${detail}`;
+      });
+      el.textContent = lines.length ? lines.join("\n") : "（暂无日志）";
+      el.scrollTop = el.scrollHeight;
+    }
+    $("#btn-log-refresh") && ($("#btn-log-refresh").onclick = () => loadOpsLog());
+    $("#btn-log-clear") && ($("#btn-log-clear").onclick = async () => {
+      if (!confirm("确认清空操作日志？")) return;
+      await api("/api/logs/clear", { method: "POST", body: {} });
+      loadOpsLog();
+    });
+
     $("#btn-settings").onclick = () => {
       $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === "settings"));
       $("#tab-list").classList.add("hidden");
       $("#tab-settings").classList.remove("hidden");
+      loadOpsLog();
     };
     $("#set-theme").value = localStorage.getItem("fnlxc-theme") || "auto";
     $("#set-theme").onchange = (e) => {
