@@ -440,7 +440,7 @@
             <button id="btn-log-refresh">刷新</button>
             <button id="btn-log-clear">清空</button>
           </div>
-          <p class="hint" style="margin-top:0">记录启停、创建、快照、配置等操作的成功与失败，文件在数据目录 ops.log。</p>
+          <p class="hint" style="margin-top:0">记录启停、创建、快照、配置等操作的成功与失败；打开本页后每 2 秒自动刷新。文件：数据目录 ops.log。</p>
           <pre id="ops-log" class="log" style="max-height:320px;overflow:auto;font-size:12px;margin:0"></pre>
         </div>
       </div>
@@ -1245,27 +1245,50 @@
         const name = tab.dataset.tab;
         $("#tab-list").classList.toggle("hidden", name !== "list");
         $("#tab-settings").classList.toggle("hidden", name !== "settings");
+        if (name === "settings") startOpsLogLive();
+        else stopOpsLogLive();
       };
     });
     
-    async function loadOpsLog() {
-      const r = await api("/api/logs?limit=200");
+    let _opsLogTimer = null;
+    let _opsLogText = "";
+    async function loadOpsLog(silent) {
       const el = $("#ops-log");
       if (!el) return;
-      if (!r.ok) { el.textContent = r.error || "读取失败"; return; }
+      const r = await api("/api/logs?limit=200");
+      if (!r.ok) {
+        if (!silent) el.textContent = r.error || "读取失败";
+        return;
+      }
       const lines = (r.logs || []).map((x) => {
         const flag = x.ok ? "OK" : "FAIL";
         const name = x.name ? ` [${x.name}]` : "";
         const detail = x.detail ? ` — ${x.detail}` : "";
         return `${x.ts || ""} ${flag} ${x.action || ""}${name}${detail}`;
       });
-      el.textContent = lines.length ? lines.join("\n") : "（暂无日志）";
-      el.scrollTop = el.scrollHeight;
+      const text = lines.length ? lines.join("\n") : "（暂无日志）";
+      if (text === _opsLogText) return;
+      const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 24;
+      _opsLogText = text;
+      el.textContent = text;
+      if (stick) el.scrollTop = el.scrollHeight;
+    }
+    function startOpsLogLive() {
+      stopOpsLogLive();
+      loadOpsLog();
+      _opsLogTimer = setInterval(() => loadOpsLog(true), 2000);
+    }
+    function stopOpsLogLive() {
+      if (_opsLogTimer) {
+        clearInterval(_opsLogTimer);
+        _opsLogTimer = null;
+      }
     }
     $("#btn-log-refresh") && ($("#btn-log-refresh").onclick = () => loadOpsLog());
     $("#btn-log-clear") && ($("#btn-log-clear").onclick = async () => {
       if (!confirm("确认清空操作日志？")) return;
       await api("/api/logs/clear", { method: "POST", body: {} });
+      _opsLogText = "";
       loadOpsLog();
     });
 
@@ -1273,7 +1296,7 @@
       $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === "settings"));
       $("#tab-list").classList.add("hidden");
       $("#tab-settings").classList.remove("hidden");
-      loadOpsLog();
+      startOpsLogLive();
     };
     $("#set-theme").value = localStorage.getItem("fnlxc-theme") || "auto";
     $("#set-theme").onchange = (e) => {
