@@ -35,6 +35,14 @@ IPv4 设为静态时，会同时关闭容器内 **eth0** 的 DHCP（ifupdown / s
 基于 `lxc-snapshot`；dir 存储每个快照是完整副本，创建前会检查磁盘剩余空间（btrfs/zfs 跳过）。
 删除容器时会同时删除其快照（`lxc-destroy -s`）。
 
+## 自定义 rootfs / 导出
+
+「添加容器 → 自定义 rootfs」：用 NAS 上的压缩包路径或下载地址创建容器，支持 `.tar` / `.tar.gz` / `.tar.xz` / `.tar.zst` / `.tar.bz2` / `.squashfs`
+（例如 NixOS 只发布 `rootfs.squashfs`，官方 download 模板拿不到）。解包前会拒绝绝对路径和 `..` 条目，单层顶级目录自动剥掉，
+发行版由 `/etc/os-release` 识别；若只有 `/init`（NixOS）会写 `lxc.init.cmd = /init`。需要带 init 的完整系统 rootfs，Docker 导出包通常无法启动。
+squashfs 优先用 `unsquashfs`，没有则 loop 挂载后拷贝。
+已停止的容器可「更多 → 导出 rootfs」，打包为 `<lxcpath>/exports/<名称>-时间.tar.gz`，可再用自定义 rootfs 导入。
+
 ## 打包
 
 在已安装 `fnpack` 的机器上：

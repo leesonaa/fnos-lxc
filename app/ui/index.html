@@ -455,6 +455,26 @@
         <label>名称</label>
         <input id="add-name" placeholder="my-debian" style="width:100%" />
       </div>
+      <div class="row" style="margin-bottom:10px" id="add-mode">
+        <button class="primary" data-m="std">官方镜像</button>
+        <button data-m="custom">自定义 rootfs</button>
+      </div>
+      <div id="add-custom" class="hidden">
+        <div class="field">
+          <label>rootfs 压缩包路径（NAS 上的文件）</label>
+          <input id="add-cpath" placeholder="/vol1/1000/images/rootfs.tar.xz" style="width:100%" />
+        </div>
+        <div class="field">
+          <label>或填下载地址（填了则优先使用）</label>
+          <input id="add-curl" placeholder="https://…/rootfs.tar.xz 或 rootfs.squashfs" style="width:100%" />
+        </div>
+        <div class="grid2">
+          <div class="field"><label>发行版标识（用于图标，可留空自动识别）</label><input id="add-cdistro" placeholder="如 nixos / debian" /></div>
+          <div class="field"><label>架构</label><select id="add-carch"><option value="">与宿主机相同</option><option>amd64</option><option>arm64</option><option>armhf</option><option>i386</option></select></div>
+        </div>
+        <p class="hint">支持 .tar / .tar.gz / .tar.xz / .tar.zst / .tar.bz2 / .squashfs（如 NixOS 只发布 rootfs.squashfs）。必须是带 init 的完整系统 rootfs，Docker 镜像导出的包通常无法启动。压缩包需来自可信来源。</p>
+      </div>
+      <div id="add-std">
       <div class="field">
         <label>镜像源（国内用户建议选高校镜像，下载更快）</label>
         <select id="add-mirror" style="width:100%"></select>
@@ -466,6 +486,7 @@
       <div class="field">
         <label>版本</label>
         <select id="add-release" style="width:100%"></select>
+      </div>
       </div>
       <div class="field">
         <label><input type="checkbox" id="add-autostart" /> 开机自启</label>
@@ -902,6 +923,7 @@
       if (st === "RUNNING") items.push(["kill", "强制停止"], ["freeze", "冻结"]);
       else if (st === "FROZEN") items.push(["kill", "强制停止"]);
       items.push(["snap", "快照"]);
+      if (st === "STOPPED") items.push(["export", "导出 rootfs"]);
       items.push(["destroy", "删除", "danger"]);
       menu.innerHTML = items.map(([a, t, cls]) => `<button data-a="${a}" class="${cls || ""}">${t}</button>`).join("");
       menu.classList.remove("hidden");
@@ -913,7 +935,7 @@
         const b = e.target.closest("button[data-a]");
         if (!b) return;
         closeMenu();
-        if (b.dataset.a === "snap") openSnap(n); else onAction(n, b.dataset.a);
+        if (b.dataset.a === "snap") openSnap(n); else if (b.dataset.a === "export") exportCt(n); else onAction(n, b.dataset.a);
       };
     }
     document.addEventListener("click", (e) => {
@@ -1018,6 +1040,22 @@
         if (nn) snapRun({ op: "restore", snap, as_new: nn.trim(), confirm: true }, "正在克隆");
       }
     });
+
+    async function exportCt(name) {
+      if (!confirm(`把 ${name} 的 rootfs 打包为 .tar.gz？\n文件保存在容器存储目录下的 exports/，可用于「自定义 rootfs」重新创建。`)) return;
+      toast("开始导出…");
+      const r = await api(`/api/container/${encodeURIComponent(name)}/export`, { method: "POST", body: {} });
+      if (!r.ok) { toast(r.error || "失败"); return; }
+      for (;;) {
+        await new Promise((x) => setTimeout(x, 2000));
+        const j = await api(`/api/job/${r.job}`);
+        if (!j.ok) { toast(j.error || "任务丢失"); return; }
+        if (j.status === "running") continue;
+        if (j.status === "done") alert(`导出完成：\n${(j.log || [])[0] || r.dest}`);
+        else toast(j.error || "导出失败");
+        return;
+      }
+    }
 
     async function onAction(name, action, btn) {
       if (action === "destroy" && !confirm(`确认删除容器 ${name}？其所有快照也会一并删除，此操作不可恢复。`)) return;
@@ -1157,7 +1195,17 @@
     $("#add-distro").onchange = fillReleases;
     function fmtMB(n) { return (n / 1048576).toFixed(1) + " MB"; }
     let addJob = null;
+    let addMode = "std";
+    $("#add-mode").addEventListener("click", (e) => {
+      const b = e.target.closest("button[data-m]");
+      if (!b) return;
+      addMode = b.dataset.m;
+      $$("#add-mode button").forEach((x) => x.classList.toggle("primary", x === b));
+      $("#add-std").classList.toggle("hidden", addMode !== "std");
+      $("#add-custom").classList.toggle("hidden", addMode !== "custom");
+    });
     function addBusy(b) {
+      $$("#add-custom input, #add-custom select, #add-mode button").forEach((x) => (x.disabled = b));
       $("#add-ok").disabled = b;
       $("#add-name").disabled = $("#add-mirror").disabled = $("#add-distro").disabled = $("#add-release").disabled = b;
     }
@@ -1221,18 +1269,26 @@
     $("#add-ok").onclick = async () => {
       const name = $("#add-name").value.trim();
       if (!name) { toast("请输入名称"); return; }
+      const custom = addMode === "custom";
       const distro = $("#add-distro").value, release = $("#add-release").value;
-      if (!release) { toast("请选择版本"); return; }
+      if (!custom && !release) { toast("请选择版本"); return; }
+      if (custom && !$("#add-cpath").value.trim() && !$("#add-curl").value.trim()) { toast("请填写压缩包路径或下载地址"); return; }
       addBusy(true);
       $("#add-prog").classList.remove("hidden");
       $("#add-log").classList.add("hidden");
       $("#add-stage").textContent = "开始创建…";
       $("#add-detail").textContent = "";
       $("#add-bar").classList.add("indet");
-      const r = await api("/api/container/create", {
-        method: "POST",
-        body: { name, distro, release, mirror: $("#add-mirror").value, autostart: $("#add-autostart").checked },
-      });
+      const r = custom
+        ? await api("/api/container/create-custom", {
+            method: "POST",
+            body: { name, path: $("#add-cpath").value.trim(), url: $("#add-curl").value.trim(),
+                    distro: $("#add-cdistro").value.trim(), arch: $("#add-carch").value, autostart: $("#add-autostart").checked },
+          })
+        : await api("/api/container/create", {
+            method: "POST",
+            body: { name, distro, release, mirror: $("#add-mirror").value, autostart: $("#add-autostart").checked },
+          });
       if (!r.ok) { addBusy(false); toast(r.error || "创建失败"); $("#add-prog").classList.add("hidden"); return; }
       addJob = r.job;
       pollJob(r.job);

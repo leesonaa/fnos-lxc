@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import customfs
 import guestnet
 import lxcconf
 import oplog
@@ -1100,6 +1101,229 @@ def get_job(jid: str) -> dict:
         return {"ok": True, **j} if j else {"ok": False, "error": "任务不存在"}
 
 
+# ----- 自定义 rootfs 创建 / 导出 -----
+
+def _custom_fail(job: dict, name: str, msg: str, cdir: Path | None = None) -> None:
+    if cdir and cdir.exists():
+        shutil.rmtree(cdir, ignore_errors=True)
+    _job_set(job, status="error", error=msg[:500])
+    oplog.log("container.create_custom", ok=False, name=name, detail=msg[:500])
+
+
+def _extract_squash(job: dict, src: str, dst: Path) -> str:
+    """返回错误信息，空串表示成功。优先 unsquashfs，没有则 loop 挂载后拷贝。"""
+    if which("unsquashfs"):
+        r = run(["unsquashfs", "-f", "-d", str(dst), src], timeout=7200)
+        return "" if r["ok"] else _snap_err(r)
+    import tempfile
+    mnt = tempfile.mkdtemp(prefix="fnlxc-sq-")
+    try:
+        r = run(["mount", "-t", "squashfs", "-o", "loop,ro", src, mnt], timeout=60)
+        if not r["ok"]:
+            return "没有 unsquashfs，且 loop 挂载 squashfs 失败（可 apt install squashfs-tools）：" + _snap_err(r)
+        try:
+            p1 = subprocess.Popen(["tar", "--numeric-owner", "--xattrs", "-C", mnt, "-cf", "-", "."], stdout=subprocess.PIPE)
+            p2 = subprocess.run(["tar", "--numeric-owner", "-C", str(dst), "-xpf", "-"], stdin=p1.stdout,
+                                capture_output=True, text=True, timeout=7200)
+            p1.stdout.close()
+            p1.wait()
+            return "" if p2.returncode == 0 and p1.returncode == 0 else (p2.stderr or "拷贝失败")[-300:]
+        finally:
+            run(["umount", mnt], timeout=60)
+    finally:
+        shutil.rmtree(mnt, ignore_errors=True)
+
+
+def _custom_worker(job: dict, name: str, src: str, url: str, distro: str, release: str, arch: str, autostart: bool) -> None:
+    t0 = time.time()
+    cdir = lxc_base() / name
+    downloaded = None
+    try:
+        # 1) 取得本地文件
+        if url:
+            ext = customfs.ext_of(url)
+            cache = lxc_base() / "cache" / "custom"
+            cache.mkdir(parents=True, exist_ok=True)
+            downloaded = cache / f"{name}{ext}"
+            _job_set(job, stage="下载 rootfs", progress=5)
+            try:
+                with _http(url, "GET", timeout=60) as resp, open(downloaded, "wb") as f:
+                    total = int(resp.headers.get("Content-Length") or 0)
+                    _job_set(job, total=total)
+                    got = 0
+                    while True:
+                        chunk = resp.read(1 << 20)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        got += len(chunk)
+                        _job_set(job, downloaded=got, elapsed=int(time.time() - t0),
+                                 progress=5 + (min(45, int(got * 45 / total)) if total else 0))
+            except Exception as e:  # noqa: BLE001
+                return _custom_fail(job, name, f"下载失败：{e}")
+            src = str(downloaded)
+        kind = customfs.classify(src)
+        size = os.path.getsize(src)
+        free = _free_bytes(lxc_base())
+        if free and size > free:
+            return _custom_fail(job, name, f"磁盘空间不足：文件 {size >> 20} MB，剩余 {free >> 20} MB")
+
+        # 2) 预检
+        strip = 0
+        if kind == "tar":
+            _job_set(job, stage="检查压缩包", progress=52)
+            if customfs.ext_of(src) == ".tar.zst" and not which("zstd"):
+                return _custom_fail(job, name, "缺少 zstd，请先 apt install zstd")
+            lst = run(["tar", "-tf", src], timeout=1800)
+            if not lst["ok"]:
+                return _custom_fail(job, name, "无法读取压缩包：" + _snap_err(lst))
+            names = [x for x in lst["stdout"].splitlines() if x]
+            ok, why = customfs.check_members(names)
+            if not ok:
+                return _custom_fail(job, name, why)
+            strip = customfs.strip_components(names)
+        # 3) 解包
+        cdir.mkdir(parents=True)
+        rootfs = cdir / "rootfs"
+        rootfs.mkdir()
+        _job_set(job, stage="解包 rootfs（可能需要几分钟）", progress=55)
+        if kind == "tar":
+            argv = ["tar", "--numeric-owner", "--xattrs", "-xpf", src, "-C", str(rootfs)]
+            if strip:
+                argv.append(f"--strip-components={strip}")
+            r = run(argv, timeout=7200)
+            if not r["ok"] and "xattr" in (r["stderr"] or "").lower():
+                r = run([a for a in argv if a != "--xattrs"], timeout=7200)
+            if not r["ok"]:
+                return _custom_fail(job, name, "解包失败：" + _snap_err(r), cdir)
+        else:
+            err = _extract_squash(job, src, rootfs)
+            if err:
+                return _custom_fail(job, name, "解包失败：" + err, cdir)
+        # 4) 检查 init、写配置
+        _job_set(job, stage="生成容器配置", progress=92)
+        kind_init = customfs.init_kind(lambda rel: (rootfs / rel).exists() or (rootfs / rel).is_symlink())
+        if not kind_init:
+            with _JOBS_LOCK:
+                job["log"] = (job["log"] + ["警告：rootfs 里没有找到 init（/sbin/init 等），容器可能无法启动。Docker 导出的镜像通常不适用。"])[-30:]
+        if not distro:
+            try:
+                m = re.search(r'^ID="?([A-Za-z0-9._-]+)"?', (rootfs / "etc/os-release").read_text(errors="ignore"), re.M)
+                distro = m.group(1).lower() if m else ""
+            except OSError:
+                pass
+        inc = Path("/usr/share/lxc/config")
+        include = next((str(inc / f) for f in (f"{distro}.common.conf", "common.conf") if (inc / f).exists()), str(inc / "common.conf"))
+        try:
+            default_conf = Path("/etc/lxc/default.conf").read_text()
+        except OSError:
+            default_conf = ""
+        text = customfs.build_config(name, str(rootfs), distro, release, arch or host_arch(), default_conf, include,
+                                     "/init" if kind_init == "init" else "")
+        s = lxcconf.parse_settings(text)
+        s["autostart"] = bool(autostart)
+        s["bridge"] = s["bridge"] or load_config().get("bridge") or "br0"
+        _atomic_write(cdir / "config", lxcconf.apply_settings(text, s))
+        _job_set(job, status="done", progress=100, stage="完成")
+        oplog.log("container.create_custom", ok=True, name=name, distro=distro, detail=Path(src).name)
+    except Exception as e:  # noqa: BLE001
+        _custom_fail(job, name, f"{type(e).__name__}: {e}", cdir)
+    finally:
+        if downloaded:
+            try:
+                downloaded.unlink()
+            except OSError:
+                pass
+
+
+def _new_job(name: str) -> tuple[dict | None, str]:
+    with _JOBS_LOCK:
+        if any(j["name"] == name and j["status"] == "running" for j in _JOBS.values()):
+            return None, "该名称正有任务在执行"
+        jid = f"{int(time.time() * 1000)}"
+        job = {"id": jid, "name": name, "status": "running", "progress": 1, "stage": "开始",
+               "log": [], "elapsed": 0, "downloaded": 0, "total": 0, "error": ""}
+        _JOBS[jid] = job
+        for k in [k for k, j in _JOBS.items() if j["status"] != "running"][:-10]:
+            _JOBS.pop(k, None)
+    return job, ""
+
+
+def create_custom_container(body: dict) -> dict:
+    name = clean_name(body.get("name", ""))
+    if not name:
+        return {"ok": False, "error": "名称无效（字母/数字/. _ -，以字母或数字开头）"}
+    if ct_config_path(name) or (lxc_base() / name).exists():
+        return {"ok": False, "error": "容器已存在"}
+    src, url = "", ""
+    if str(body.get("url") or "").strip():
+        url, err = customfs.check_url(body.get("url"))
+    else:
+        src, err = customfs.check_source_path(body.get("path"))
+        if not err and not os.path.isfile(src):
+            err = "文件不存在或不是普通文件"
+    if err:
+        return {"ok": False, "error": err}
+    distro = re.sub(r"[^a-z0-9]", "", str(body.get("distro") or "").lower())
+    release = re.sub(r"[^A-Za-z0-9._-]", "", str(body.get("release") or ""))
+    arch = re.sub(r"[^a-z0-9_]", "", str(body.get("arch") or "")) or host_arch()
+    job, err = _new_job(name)
+    if not job:
+        return {"ok": False, "error": err}
+    threading.Thread(target=_custom_worker, args=(job, name, src, url, distro, release, arch, bool(body.get("autostart"))),
+                     daemon=True).start()
+    oplog.log("container.create_custom.start", ok=True, name=name, detail=url or src)
+    return {"ok": True, "job": job["id"], "name": name}
+
+
+def _export_worker(job: dict, name: str, dest: Path) -> None:
+    cp = ct_config_path(name)
+    try:
+        rootfs = guestnet.rootfs_path(cp) if cp else None
+        if not rootfs:
+            _job_set(job, status="error", error="找不到 rootfs 目录（仅支持 dir 存储）")
+            return
+        dest.mkdir(parents=True, exist_ok=True)
+        out = dest / f"{name}-{time.strftime('%Y%m%d-%H%M%S')}.tar.gz"
+        _job_set(job, stage="打包 rootfs（可能需要几分钟）", progress=10)
+        r = run(["tar", "--numeric-owner", "--xattrs", "-czpf", str(out), "-C", str(rootfs), "."], timeout=7200)
+        if not r["ok"] and "xattr" in (r["stderr"] or "").lower():
+            r = run(["tar", "--numeric-owner", "-czpf", str(out), "-C", str(rootfs), "."], timeout=7200)
+        if r["ok"] or r["code"] == 1:  # tar 退出码 1 = 文件在读取时有变化，仍然可用
+            with _JOBS_LOCK:
+                job["log"] = [str(out)]
+            _job_set(job, status="done", progress=100, stage="完成：" + str(out))
+            oplog.log("container.export", ok=True, name=name, detail=str(out))
+        else:
+            out.unlink(missing_ok=True)
+            _job_set(job, status="error", error="打包失败：" + _snap_err(r))
+            oplog.log("container.export", ok=False, name=name, detail=_snap_err(r)[:300])
+    except Exception as e:  # noqa: BLE001
+        _job_set(job, status="error", error=f"{type(e).__name__}: {e}")
+
+
+def export_container(name: str, body: dict) -> dict:
+    name = clean_name(name)
+    cp = ct_config_path(name) if name else None
+    if not cp:
+        return {"ok": False, "error": "容器不存在"}
+    if _container_state(name) not in ("STOPPED", ""):
+        return {"ok": False, "error": "导出前请先停止容器（保证文件一致）"}
+    d = str(body.get("dest") or "").strip()
+    if d:
+        d, err, _ = check_lxcpath(d)
+        if err:
+            return {"ok": False, "error": err}
+        dest = Path(d)
+    else:
+        dest = lxc_base() / "exports"
+    job, err = _new_job(name)
+    if not job:
+        return {"ok": False, "error": err}
+    threading.Thread(target=_export_worker, args=(job, name, dest), daemon=True).start()
+    return {"ok": True, "job": job["id"], "dest": str(dest)}
+
+
 # ----- 容器配置（表单 / 原始） -----
 
 def _prepare_host_devices(s: dict) -> None:
@@ -1693,6 +1917,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": False, "error": "网桥名称无效"})
                 return
             self._json(200, finalize_init(lxcpath, bridge, _clamp_int(body.get("timeout"), 15, 1, 600)))
+            return
+
+        if path == "/api/container/create-custom":
+            self._json(200, create_custom_container(body))
+            return
+
+        m = re.match(r"^/api/container/([^/]+)/export$", path)
+        if m:
+            self._json(200, export_container(m.group(1), body))
             return
 
         if path == "/api/container/create":
