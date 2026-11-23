@@ -30,6 +30,7 @@ import customfs
 import guestnet
 import lxcconf
 import oplog
+import rootstore
 
 # ---------------------------------------------------------------------------
 # Paths & config
@@ -583,6 +584,14 @@ def list_containers() -> list:
         c["ipv4"], c["ipv6"] = container_ips(c["name"]) if c["state"] == "RUNNING" else ([], [])
         c["distro"], c["release"] = detect_distro(c["name"])
         p = ct_config_path(c["name"])
+        c["rootfs_kind"], c["img_gb"] = "dir", 0
+        if p:
+            try:
+                img = rootstore.image_path(p.read_text(errors="ignore"))
+            except OSError:
+                img = None
+            if img:
+                c["rootfs_kind"], c["img_gb"] = "loop", round(rootstore.apparent_bytes(img) / (1 << 30), 1)
         mem_mb = 0
         cpu_cores = 0
         try:
@@ -744,7 +753,9 @@ def _snapshot_worker(job: dict, name: str, op: str, snap: str, comment: str, fre
             cp = ct_config_path(name)
             if cp and _fstype(cp.parent) not in ("btrfs", "zfs"):
                 _job_set(job, stage="检查磁盘空间", progress=3)
-                need, free = _dir_bytes(cp.parent / "rootfs"), _free_bytes(cp.parent)
+                img = rootstore.image_path(cp.read_text(errors="ignore"))
+                need = rootstore.alloc_bytes(img) if img else _dir_bytes(cp.parent / "rootfs")
+                free = _free_bytes(cp.parent)
                 if need and free and need > free:
                     _job_set(job, status="error", error=f"磁盘空间不足：容器约 {need >> 20} MB，剩余 {free >> 20} MB")
                     return
@@ -997,9 +1008,13 @@ def _find_rootfs_download(distro: str, release: str, arch: str):
     return best
 
 
-def _create_worker(job: dict, name: str, distro: str, release: str, arch: str, autostart: bool, mid: str) -> None:
+def _create_worker(job: dict, name: str, distro: str, release: str, arch: str, autostart: bool, mid: str,
+                   storage: str = "dir", size_gb: int = 0) -> None:
     t0 = time.time()
-    argv = ["lxc-create", "-n", name, "-t", "download", "--", "-d", distro, "-r", release, "-a", arch]
+    argv = ["lxc-create", "-n", name, "-t", "download"]
+    if storage == "loop":
+        argv += ["-B", "loop", "--fssize", f"{size_gb}G", "--fstype", "ext4"]
+    argv += ["--", "-d", distro, "-r", release, "-a", arch]
     if mid != "official":
         argv += ["--server", image_server(mid).split("://", 1)[-1]]
     try:
@@ -1074,6 +1089,9 @@ def create_container(body: dict) -> dict:
         return {"ok": False, "error": "名称无效（字母/数字/. _ -，以字母或数字开头）"}
     if ct_config_path(name):
         return {"ok": False, "error": "容器已存在"}
+    storage, size_gb, err = _parse_storage(body)
+    if err:
+        return {"ok": False, "error": err}
     mid = mirror_id(str(body.get("mirror") or ""))
     if mid != load_config().get("image_mirror"):
         cfg = load_config()
@@ -1089,7 +1107,9 @@ def create_container(body: dict) -> dict:
         for k in [k for k, j in _JOBS.items() if j["status"] != "running"][:-10]:
             _JOBS.pop(k, None)
     threading.Thread(
-        target=_create_worker, args=(job, name, distro, release, arch, bool(body.get("autostart")), mid), daemon=True
+        target=_create_worker,
+        args=(job, name, distro, release, arch, bool(body.get("autostart")), mid, storage, size_gb),
+        daemon=True,
     ).start()
     oplog.log("container.create.start", ok=True, name=name, distro=distro, release=release, arch=arch, mirror=mid)
     return {"ok": True, "job": jid, "name": name}
@@ -1134,7 +1154,8 @@ def _extract_squash(job: dict, src: str, dst: Path) -> str:
         shutil.rmtree(mnt, ignore_errors=True)
 
 
-def _custom_worker(job: dict, name: str, src: str, url: str, distro: str, release: str, arch: str, autostart: bool) -> None:
+def _custom_worker(job: dict, name: str, src: str, url: str, distro: str, release: str, arch: str, autostart: bool,
+                   storage: str = "dir", size_gb: int = 0) -> None:
     t0 = time.time()
     cdir = lxc_base() / name
     downloaded = None
@@ -1167,6 +1188,10 @@ def _custom_worker(job: dict, name: str, src: str, url: str, distro: str, releas
         free = _free_bytes(lxc_base())
         if free and size > free:
             return _custom_fail(job, name, f"磁盘空间不足：文件 {size >> 20} MB，剩余 {free >> 20} MB")
+        if storage == "loop":
+            msg = rootstore.check_size_vs_free(size_gb, free)
+            if msg:
+                return _custom_fail(job, name, msg)
 
         # 2) 预检
         strip = 0
@@ -1182,54 +1207,79 @@ def _custom_worker(job: dict, name: str, src: str, url: str, distro: str, releas
             if not ok:
                 return _custom_fail(job, name, why)
             strip = customfs.strip_components(names)
-        # 3) 解包
+        # 3) 解包（dir：直接解到目录；loop：先建 ext4 镜像并挂载，再解进去）
+        def populate(rootfs: Path) -> str:
+            """解包 + 架构/init 检查；返回错误信息，成功返回 ''。结果通过 nonlocal 带出。"""
+            nonlocal distro, init_kind
+            _job_set(job, stage="解包 rootfs（可能需要几分钟）", progress=55)
+            if kind == "tar":
+                argv = ["tar", "--numeric-owner", "--xattrs", "-xpf", src, "-C", str(rootfs)]
+                if strip:
+                    argv.append(f"--strip-components={strip}")
+                r = run(argv, timeout=7200)
+                if not r["ok"] and "xattr" in (r["stderr"] or "").lower():
+                    r = run([a for a in argv if a != "--xattrs"], timeout=7200)
+                if not r["ok"]:
+                    return "解包失败：" + _snap_err(r)
+            else:
+                err = _extract_squash(job, src, rootfs)
+                if err:
+                    return "解包失败：" + err
+            # 架构检查（LXC 只能原生运行与宿主机相同架构的容器）
+            guest_arch = customfs.elf_arch(rootfs)
+            if guest_arch and not customfs.arch_compatible(arch, guest_arch):
+                return f"rootfs 是 {guest_arch} 架构，而本机是 {customfs.ARCH_MAP.get(arch, arch)}：LXC 不能运行异构架构的容器"
+            init_kind = customfs.init_kind(lambda rel: (rootfs / rel).exists() or (rootfs / rel).is_symlink())
+            if not distro:
+                try:
+                    m = re.search(r'^ID="?([A-Za-z0-9._-]+)"?', (rootfs / "etc/os-release").read_text(errors="ignore"), re.M)
+                    distro = m.group(1).lower() if m else ""
+                except OSError:
+                    pass
+            return ""
+
+        init_kind = ""
         cdir.mkdir(parents=True)
-        rootfs = cdir / "rootfs"
-        rootfs.mkdir()
-        _job_set(job, stage="解包 rootfs（可能需要几分钟）", progress=55)
-        if kind == "tar":
-            argv = ["tar", "--numeric-owner", "--xattrs", "-xpf", src, "-C", str(rootfs)]
-            if strip:
-                argv.append(f"--strip-components={strip}")
-            r = run(argv, timeout=7200)
-            if not r["ok"] and "xattr" in (r["stderr"] or "").lower():
-                r = run([a for a in argv if a != "--xattrs"], timeout=7200)
-            if not r["ok"]:
-                return _custom_fail(job, name, "解包失败：" + _snap_err(r), cdir)
-        else:
-            err = _extract_squash(job, src, rootfs)
+        if storage == "loop":
+            img = cdir / "rootfs.img"
+            _job_set(job, stage=f"创建 {size_gb} GB ext4 镜像", progress=53)
+            err = rootstore.mkfs_image(img, size_gb, name)
             if err:
-                return _custom_fail(job, name, "解包失败：" + err, cdir)
-        # 4) 架构检查（LXC 只能原生运行与宿主机相同架构的容器）
-        guest_arch = customfs.elf_arch(rootfs)
-        if guest_arch and not customfs.arch_compatible(arch, guest_arch):
-            return _custom_fail(job, name, f"rootfs 是 {guest_arch} 架构，而本机是 {customfs.ARCH_MAP.get(arch, arch)}：LXC 不能运行异构架构的容器", cdir)
-        # 5) 检查 init、写配置
+                return _custom_fail(job, name, err, cdir)
+            try:
+                with rootstore.mounted_image(img) as mnt:
+                    err = populate(mnt)
+            except rootstore.RootfsError as e:
+                err = str(e)
+            if err:
+                return _custom_fail(job, name, err, cdir)
+            rootfs_spec = f"loop:{img}"
+        else:
+            rootfs = cdir / "rootfs"
+            rootfs.mkdir()
+            err = populate(rootfs)
+            if err:
+                return _custom_fail(job, name, err, cdir)
+            rootfs_spec = f"dir:{rootfs}"
+        # 4) 写配置
         _job_set(job, stage="生成容器配置", progress=92)
-        kind_init = customfs.init_kind(lambda rel: (rootfs / rel).exists() or (rootfs / rel).is_symlink())
-        if not kind_init:
+        if not init_kind:
             with _JOBS_LOCK:
                 job["log"] = (job["log"] + ["警告：rootfs 里没有找到 init（/sbin/init 等），容器可能无法启动。Docker 导出的镜像通常不适用。"])[-30:]
-        if not distro:
-            try:
-                m = re.search(r'^ID="?([A-Za-z0-9._-]+)"?', (rootfs / "etc/os-release").read_text(errors="ignore"), re.M)
-                distro = m.group(1).lower() if m else ""
-            except OSError:
-                pass
         inc = Path("/usr/share/lxc/config")
         include = next((str(inc / f) for f in (f"{distro}.common.conf", "common.conf") if (inc / f).exists()), str(inc / "common.conf"))
         try:
             default_conf = Path("/etc/lxc/default.conf").read_text()
         except OSError:
             default_conf = ""
-        text = customfs.build_config(name, str(rootfs), distro, release, arch or host_arch(), default_conf, include,
-                                     "/init" if kind_init == "init" else "")
+        text = customfs.build_config(name, rootfs_spec, distro, release, arch or host_arch(), default_conf, include,
+                                     "/init" if init_kind == "init" else "")
         s = lxcconf.parse_settings(text)
         s["autostart"] = bool(autostart)
         s["bridge"] = s["bridge"] or load_config().get("bridge") or "br0"
         _atomic_write(cdir / "config", lxcconf.apply_settings(text, s))
         _job_set(job, status="done", progress=100, stage="完成")
-        oplog.log("container.create_custom", ok=True, name=name, distro=distro, detail=Path(src).name)
+        oplog.log("container.create_custom", ok=True, name=name, distro=distro, detail=Path(src).name, storage=storage)
     except Exception as e:  # noqa: BLE001
         _custom_fail(job, name, f"{type(e).__name__}: {e}", cdir)
     finally:
@@ -1253,6 +1303,20 @@ def _new_job(name: str) -> tuple[dict | None, str]:
     return job, ""
 
 
+def _parse_storage(body: dict) -> tuple[str, int, str]:
+    """前端传入的 storage=dir|loop 与 size_gb；返回 (storage, size_gb, 错误)。"""
+    storage = "loop" if str(body.get("storage") or "dir") == "loop" else "dir"
+    if storage == "dir":
+        return "dir", 0, ""
+    if not (which("mkfs.ext4") and which("losetup")):
+        return "", 0, "宿主机缺少 mkfs.ext4 / losetup（apt install e2fsprogs mount）"
+    size_gb, err = rootstore.valid_size_gb(body.get("size_gb"))
+    if err:
+        return "", 0, err
+    err = rootstore.check_size_vs_free(size_gb, _free_bytes(lxc_base()))
+    return "loop", size_gb, err
+
+
 def create_custom_container(body: dict) -> dict:
     name = clean_name(body.get("name", ""))
     if not name:
@@ -1271,10 +1335,14 @@ def create_custom_container(body: dict) -> dict:
     distro = re.sub(r"[^a-z0-9]", "", str(body.get("distro") or "").lower())
     release = re.sub(r"[^A-Za-z0-9._-]", "", str(body.get("release") or ""))
     arch = host_arch()  # LXC 只能原生运行本机架构，忽略前端传入的架构
+    storage, size_gb, err = _parse_storage(body)
+    if err:
+        return {"ok": False, "error": err}
     job, err = _new_job(name)
     if not job:
         return {"ok": False, "error": err}
-    threading.Thread(target=_custom_worker, args=(job, name, src, url, distro, release, arch, bool(body.get("autostart"))),
+    threading.Thread(target=_custom_worker,
+                     args=(job, name, src, url, distro, release, arch, bool(body.get("autostart")), storage, size_gb),
                      daemon=True).start()
     oplog.log("container.create_custom.start", ok=True, name=name, detail=url or src)
     return {"ok": True, "job": job["id"], "name": name}
@@ -1283,16 +1351,20 @@ def create_custom_container(body: dict) -> dict:
 def _export_worker(job: dict, name: str, dest: Path) -> None:
     cp = ct_config_path(name)
     try:
-        rootfs = guestnet.rootfs_path(cp) if cp else None
-        if not rootfs:
-            _job_set(job, status="error", error="找不到 rootfs 目录（仅支持 dir 存储）")
-            return
         dest.mkdir(parents=True, exist_ok=True)
         out = dest / f"{name}-{time.strftime('%Y%m%d-%H%M%S')}.tar.gz"
-        _job_set(job, stage="打包 rootfs（可能需要几分钟）", progress=10)
-        r = run(["tar", "--numeric-owner", "--xattrs", "-czpf", str(out), "-C", str(rootfs), "."], timeout=7200)
-        if not r["ok"] and "xattr" in (r["stderr"] or "").lower():
-            r = run(["tar", "--numeric-owner", "-czpf", str(out), "-C", str(rootfs), "."], timeout=7200)
+        try:
+            with rootstore.access(cp, rw=False) as rootfs:
+                if not rootfs:
+                    _job_set(job, status="error", error="找不到可用的 rootfs（不支持该存储类型）")
+                    return
+                _job_set(job, stage="打包 rootfs（可能需要几分钟）", progress=10)
+                r = run(["tar", "--numeric-owner", "--xattrs", "-czpf", str(out), "-C", str(rootfs), "."], timeout=7200)
+                if not r["ok"] and "xattr" in (r["stderr"] or "").lower():
+                    r = run(["tar", "--numeric-owner", "-czpf", str(out), "-C", str(rootfs), "."], timeout=7200)
+        except rootstore.RootfsError as e:
+            _job_set(job, status="error", error=str(e))
+            return
         if r["ok"] or r["code"] == 1:  # tar 退出码 1 = 文件在读取时有变化，仍然可用
             with _JOBS_LOCK:
                 job["log"] = [str(out)]
@@ -1326,6 +1398,55 @@ def export_container(name: str, body: dict) -> dict:
         return {"ok": False, "error": err}
     threading.Thread(target=_export_worker, args=(job, name, dest), daemon=True).start()
     return {"ok": True, "job": job["id"], "dest": str(dest)}
+
+
+# ----- ext4 镜像：信息 / 扩容 -----
+
+def storage_info() -> dict:
+    base = lxc_base()
+    free = _free_bytes(base)
+    return {"ok": True, "path": str(base), "fstype": _fstype(base), "free": free,
+            "can_loop": bool(which("mkfs.ext4") and which("losetup"))}
+
+
+def _resize_worker(job: dict, name: str, img: Path, new_gb: int) -> None:
+    _job_set(job, stage="扩容镜像（truncate → e2fsck → resize2fs）", progress=20)
+    err = rootstore.resize_image(img, new_gb)
+    if err:
+        _job_set(job, status="error", error=err)
+        oplog.log("container.resize", ok=False, name=name, detail=err)
+    else:
+        _job_set(job, status="done", progress=100, stage="完成")
+        oplog.log("container.resize", ok=True, name=name, detail=f"{new_gb}GB")
+
+
+def resize_container(name: str, body: dict) -> dict:
+    name = clean_name(name)
+    cp = ct_config_path(name) if name else None
+    if not cp:
+        return {"ok": False, "error": "容器不存在"}
+    img = rootstore.image_path(cp.read_text(errors="ignore"))
+    if not img or not img.is_file():
+        return {"ok": False, "error": "该容器不是 ext4 镜像存储"}
+    if _container_state(name) not in ("STOPPED", ""):
+        return {"ok": False, "error": "扩容前请先停止容器"}
+    if rootstore.is_attached(img):
+        return {"ok": False, "error": "镜像正被占用（容器运行中或已被挂载），请先停止容器并卸载"}
+    new_gb, err = rootstore.valid_size_gb(body.get("size_gb"))
+    if err:
+        return {"ok": False, "error": err}
+    cur = rootstore.apparent_bytes(img)
+    if new_gb * (1 << 30) <= cur:
+        return {"ok": False, "error": f"只支持扩容：新大小需大于当前的 {cur >> 30} GB"}
+    # 超卖检查：新增的上限不能超过磁盘剩余空间
+    err = rootstore.check_size_vs_free(new_gb, _free_bytes(img.parent), already=cur)
+    if err:
+        return {"ok": False, "error": err}
+    job, err = _new_job(name)
+    if not job:
+        return {"ok": False, "error": err}
+    threading.Thread(target=_resize_worker, args=(job, name, img, new_gb), daemon=True).start()
+    return {"ok": True, "job": job["id"]}
 
 
 # ----- 容器配置（表单 / 原始） -----
@@ -1398,10 +1519,24 @@ def save_container_settings(name: str, raw: dict, check_mounts: bool = True) -> 
 def _sync_guest_net(p: Path, conf_text: str) -> None:
     """IPv4 静态时关闭容器内 eth0 的 DHCP，避免出现额外的自动分配地址。"""
     s = lxcconf.parse_settings(conf_text)
+    name = p.parent.name
+    pid = 0
+    if rootstore.parse_rootfs(conf_text)[0] == "loop":
+        with _JOBS_LOCK:  # 快照/扩容/导出等任务正在读写镜像时，不去挂载它
+            if any(j["name"] == name and j["status"] == "running" for j in _JOBS.values()):
+                oplog.log("container.guestnet", ok=False, name=name, detail="有任务正在使用镜像，已跳过容器内网络同步")
+                return
+    if container_state(name) in ("RUNNING", "FROZEN"):
+        r = run(["lxc-info", "-n", name, "-pH"], timeout=10)
+        pid = int(r["stdout"]) if r["ok"] and r["stdout"].strip().isdigit() else 0
+        if not pid and rootstore.parse_rootfs(conf_text)[0] == "loop":
+            return  # 运行中但取不到 PID：loop 镜像不能再挂载一次
     try:
-        guestnet.sync_guest_network(p, s["ipv4_mode"] == "static", s["ipv4_gateway"])
-    except OSError:
-        pass
+        with rootstore.access(p, pid=pid) as root:
+            if root is not None:
+                guestnet.sync_guest_network(p, s["ipv4_mode"] == "static", s["ipv4_gateway"], root=root)
+    except (OSError, rootstore.RootfsError) as e:
+        oplog.log("container.guestnet", ok=False, name=name, detail=str(e)[:300])
 
 
 def get_container_raw(name: str) -> dict:
@@ -1896,6 +2031,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, get_job(m.group(1)))
             return
 
+        if path == "/api/storage":
+            self._json(200, storage_info())
+            return
+
         m = re.match(r"^/api/container/([^/]+)/snapshots$", path)
         if m:
             self._json(200, list_snapshots(m.group(1)))
@@ -1925,6 +2064,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/container/create-custom":
             self._json(200, create_custom_container(body))
+            return
+
+        m = re.match(r"^/api/container/([^/]+)/resize$", path)
+        if m:
+            self._json(200, resize_container(m.group(1), body))
             return
 
         m = re.match(r"^/api/container/([^/]+)/export$", path)

@@ -486,6 +486,19 @@
       </div>
       </div>
       <div class="field">
+        <label>rootfs 存储格式</label>
+        <select id="add-storage" style="width:100%">
+          <option value="dir">目录（默认）</option>
+          <option value="loop">ext4 镜像（loop）</option>
+        </select>
+      </div>
+      <div class="field hidden" id="add-size-wrap">
+        <label>镜像最大大小（GB，稀疏文件，用多少占多少）</label>
+        <input id="add-size" type="number" min="1" max="4096" value="20" style="width:100%" />
+        <p class="hint" id="add-storage-hint" style="margin:4px 0 0"></p>
+        <p class="hint" style="margin:4px 0 0">NixOS 等对权限位严格的系统，在 fnOS 的 Btrfs 卷上构建会被拒绝（trimacl 不遵循 umask），请选 ext4 镜像。之后可在「更多 → 扩容」增大。</p>
+      </div>
+      <div class="field">
         <label><input type="checkbox" id="add-autostart" /> 开机自启</label>
       </div>
       <p class="hint">首次创建会从 images.linuxcontainers.org 下载模板，可能较慢。创建完成后会自动打开配置页（可设置 TUN、Docker、静态 IP 等）。</p>
@@ -800,7 +813,7 @@
         (st === "RUNNING" ? `<button data-a="stop" data-n="${n}">停止</button>`
           : st === "FROZEN" ? `<button data-a="unfreeze" data-n="${n}">解冻</button>`
           : `<button data-a="start" data-n="${n}">启动</button>`) +
-        `<button data-a="more" data-n="${n}" data-st="${st}">更多 ▾</button>`;
+        `<button data-a="more" data-n="${n}" data-st="${st}" data-loop="${c.rootfs_kind === "loop" ? c.img_gb : ""}">更多 ▾</button>`;
       const title = `<strong>${n}</strong><div class="distro">${esc(c.distro)}${c.release ? " " + esc(c.release) : ""}</div>`;
       return { n, sw, btns, title };
     }
@@ -914,13 +927,16 @@
 
     const menu = $("#more-menu");
     function closeMenu() { menu.classList.add("hidden"); menu.innerHTML = ""; }
+    let menuBtnLoop = "";
     function openMenu(btn) {
       const n = btn.dataset.n, st = btn.dataset.st;
+      menuBtnLoop = btn.dataset.loop || "";
       const items = [];
       if (st === "RUNNING") items.push(["kill", "强制停止"], ["freeze", "冻结"]);
       else if (st === "FROZEN") items.push(["kill", "强制停止"]);
       items.push(["snap", "快照"]);
       if (st === "STOPPED") items.push(["export", "导出 rootfs"]);
+      if (st === "STOPPED" && btn.dataset.loop) items.push(["resize", `扩容（当前 ${btn.dataset.loop} GB）`]);
       items.push(["destroy", "删除", "danger"]);
       menu.innerHTML = items.map(([a, t, cls]) => `<button data-a="${a}" class="${cls || ""}">${t}</button>`).join("");
       menu.classList.remove("hidden");
@@ -932,7 +948,7 @@
         const b = e.target.closest("button[data-a]");
         if (!b) return;
         closeMenu();
-        if (b.dataset.a === "snap") openSnap(n); else if (b.dataset.a === "export") exportCt(n); else onAction(n, b.dataset.a);
+        if (b.dataset.a === "snap") openSnap(n); else if (b.dataset.a === "export") exportCt(n); else if (b.dataset.a === "resize") resizeCt(n, menuBtnLoop); else onAction(n, b.dataset.a);
       };
     }
     document.addEventListener("click", (e) => {
@@ -1037,6 +1053,25 @@
         if (nn) snapRun({ op: "restore", snap, as_new: nn.trim(), confirm: true }, "正在克隆");
       }
     });
+
+    async function resizeCt(name, cur) {
+      const st = await api("/api/storage");
+      const free = st.ok ? Math.floor(st.free / 1073741824) : "?";
+      const v = prompt(`${name} 当前 ${cur} GB。输入新的镜像大小（GB，只能扩大）。\n磁盘剩余约 ${free} GB；稀疏镜像不会立刻占满，但写满宿主盘会损坏镜像，请留出余量。`, String(Math.ceil(Number(cur) * 2) || 20));
+      if (!v) return;
+      toast("扩容中…");
+      const r = await api(`/api/container/${encodeURIComponent(name)}/resize`, { method: "POST", body: { size_gb: Number(v) } });
+      if (!r.ok) { toast(r.error || "失败"); return; }
+      for (;;) {
+        await new Promise((x) => setTimeout(x, 2000));
+        const j = await api(`/api/job/${r.job}`);
+        if (!j.ok) { toast(j.error || "任务丢失"); return; }
+        if (j.status === "running") continue;
+        toast(j.status === "done" ? "扩容完成" : (j.error || "扩容失败"));
+        lastSig = ""; loadContainers();
+        return;
+      }
+    }
 
     async function exportCt(name) {
       if (!confirm(`把 ${name} 的 rootfs 打包为 .tar.gz？\n文件保存在容器存储目录下的 exports/，可用于「自定义 rootfs」重新创建。`)) return;
@@ -1202,7 +1237,7 @@
       $("#add-custom").classList.toggle("hidden", addMode !== "custom");
     });
     function addBusy(b) {
-      $$("#add-custom input, #add-custom select, #add-mode button").forEach((x) => (x.disabled = b));
+      $$("#add-custom input, #add-custom select, #add-mode button, #add-storage, #add-size").forEach((x) => (x.disabled = b));
       $("#add-ok").disabled = b;
       $("#add-name").disabled = $("#add-mirror").disabled = $("#add-distro").disabled = $("#add-release").disabled = b;
     }
@@ -1262,6 +1297,18 @@
       $("#add-mirror").innerHTML = "";
       await loadTemplates("");
     };
+    $("#add-storage").onchange = async () => {
+      const loop = $("#add-storage").value === "loop";
+      $("#add-size-wrap").classList.toggle("hidden", !loop);
+      if (!loop) return;
+      const st = await api("/api/storage");
+      if (st.ok) {
+        const g = Math.floor(st.free / 1073741824);
+        $("#add-storage-hint").textContent = `存储路径 ${st.path}（${st.fstype || "?"}），剩余约 ${g} GB；镜像上限不能超过剩余空间。` + (st.can_loop ? "" : " 缺少 mkfs.ext4 / losetup，无法使用。");
+        $("#add-size").max = String(Math.max(1, g));
+        if (Number($("#add-size").value) > g) $("#add-size").value = String(Math.max(1, Math.floor(g / 2)));
+      }
+    };
     $("#add-cancel").onclick = () => $("#modal-add").classList.add("hidden");
     $("#add-ok").onclick = async () => {
       const name = $("#add-name").value.trim();
@@ -1280,11 +1327,13 @@
         ? await api("/api/container/create-custom", {
             method: "POST",
             body: { name, path: $("#add-cpath").value.trim(), url: $("#add-curl").value.trim(),
-                    distro: $("#add-cdistro").value.trim(), autostart: $("#add-autostart").checked },
+                    distro: $("#add-cdistro").value.trim(), autostart: $("#add-autostart").checked,
+                    storage: $("#add-storage").value, size_gb: Number($("#add-size").value) },
           })
         : await api("/api/container/create", {
             method: "POST",
-            body: { name, distro, release, mirror: $("#add-mirror").value, autostart: $("#add-autostart").checked },
+            body: { name, distro, release, mirror: $("#add-mirror").value, autostart: $("#add-autostart").checked,
+                    storage: $("#add-storage").value, size_gb: Number($("#add-size").value) },
           });
       if (!r.ok) { addBusy(false); toast(r.error || "创建失败"); $("#add-prog").classList.add("hidden"); return; }
       addJob = r.job;

@@ -217,8 +217,10 @@ def _lines(fn):
     return wrap
 
 
-def sync_guest_network(config_path: Path, ipv4_static: bool, gateway: str = "") -> None:
-    root = rootfs_path(config_path)
+def sync_guest_network(config_path: Path, ipv4_static: bool, gateway: str = "", root: Path | None = None) -> None:
+    """root 可由调用方给出（loop 镜像临时挂载点 / 运行中的 /proc/<pid>/root），否则按 dir 配置解析。"""
+    if root is None:
+        root = rootfs_path(config_path)
     if root is None:
         return
     etc = root / "etc"

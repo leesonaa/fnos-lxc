@@ -90,7 +90,7 @@ def init_kind(exists) -> str:
     return ""
 
 
-def build_config(name: str, rootfs: str, distro: str, release: str, arch: str,
+def build_config(name: str, rootfs_spec: str, distro: str, release: str, arch: str,
                  default_conf: str, include_path: str, init_cmd: str = "") -> str:
     lines = [
         "# Template used to create this container: custom-rootfs (fnos-lxc)",
@@ -102,7 +102,7 @@ def build_config(name: str, rootfs: str, distro: str, release: str, arch: str,
         s = ln.strip()
         if s and not s.startswith("#") and not s.startswith(("lxc.rootfs", "lxc.uts", "lxc.arch", "lxc.include")):
             lines.append(s)
-    lines += [f"lxc.rootfs.path = dir:{rootfs}", f"lxc.uts.name = {name}"]
+    lines += [f"lxc.rootfs.path = {rootfs_spec}", f"lxc.uts.name = {name}"]
     if init_cmd:
         lines.append(f"lxc.init.cmd = {init_cmd}")
     return "\n".join(lines) + "\n"

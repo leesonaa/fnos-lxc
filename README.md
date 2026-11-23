@@ -43,6 +43,19 @@ IPv4 设为静态时，会同时关闭容器内 **eth0** 的 DHCP（ifupdown / s
 squashfs 优先用 `unsquashfs`，没有则 loop 挂载后拷贝。
 已停止的容器可「更多 → 导出 rootfs」，打包为 `<lxcpath>/exports/<名称>-时间.tar.gz`，可再用自定义 rootfs 导入。
 
+## ext4 镜像存储（loop）
+
+创建容器时可选「rootfs 存储格式」：目录（默认）或 ext4 镜像（填最大大小，稀疏文件，用多少占多少）。
+适用场景：fnOS 的 Btrfs 卷带 `trimacl` 挂载选项，创建目录时不遵循 umask，NixOS 这类对权限位严格的系统在其上构建会被拒绝
+（`suspicious ownership or permission`）；放进 ext4 镜像后恢复标准 POSIX 行为。已用 NixOS 验证默认多用户构建 + sandbox 可正常工作。
+
+- 镜像位于 `<lxcpath>/<名称>/rootfs.img`，配置为 `lxc.rootfs.path = loop:…`，由 LXC 启停时自动挂载/卸载。
+- 创建时按 `mkfs.ext4 -i 8192` 多留 inode（小文件多的系统否则会先耗尽 inode 而报「空间不足」）；Btrfs 上对空镜像设 `chattr +C`（官方镜像模板路径除外）。
+- 稀疏镜像是「超卖」的：最大大小不得超过磁盘剩余空间，写满宿主盘会损坏镜像内的文件系统。
+- 「更多 → 扩容」：停止状态下离线 `truncate → e2fsck → resize2fs`，只支持扩大。
+- 静态 IP 同步、导出 rootfs 会在容器停止时临时 loop 挂载镜像，运行中则通过 `/proc/<pid>/root` 访问；镜像已被占用时拒绝再次挂载。
+- 快照由 `lxc-snapshot` 处理 loop 后端（会复制镜像文件，注意磁盘空间）。
+
 ## 打包
 
 在已安装 `fnpack` 的机器上：

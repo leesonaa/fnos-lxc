@@ -39,7 +39,7 @@ class CustomFsTests(unittest.TestCase):
         self.assertEqual(customfs.init_kind(lambda p: False), "")
 
     def test_build_config(self):
-        t = customfs.build_config("n1", "/vol1/lxc/n1/rootfs", "nixos", "26.05", "arm64",
+        t = customfs.build_config("n1", "dir:/vol1/lxc/n1/rootfs", "nixos", "26.05", "arm64",
                                   "# c\nlxc.net.0.type = veth\nlxc.net.0.link = br0\nlxc.rootfs.path = x\n",
                                   "/usr/share/lxc/config/common.conf", "/init")
         self.assertIn("lxc.arch = aarch64", t)
