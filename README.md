@@ -3,6 +3,16 @@
 **原生 LXC**（`lxc-create` / `lxc-start` …），不是 Incus/LXD。  
 `platform=all`，x86 / ARM 均可。
 
+## 界面预览
+
+**列表视图**
+
+![列表视图](docs/screenshot-list.png)
+
+**卡片视图**（顶部灵动岛汇总已最小化的终端，操作提示也在这里显示）
+
+![卡片视图](docs/screenshot-cards.png)
+
 ## 用户流程
 
 1. 用 `fnpack build` 打出 `fnos-lxc.fpk`，在飞牛「应用中心 → 手动安装」
