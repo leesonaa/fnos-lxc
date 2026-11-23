@@ -1088,6 +1088,8 @@ def create_container(body: dict) -> dict:
     storage, size_gb, err = _parse_storage(body)
     if err:
         return {"ok": False, "error": err}
+    if storage == "dir" and distro == "nixos":
+        return {"ok": False, "error": NIXOS_DIR_MSG}
     mid = mirror_id(str(body.get("mirror") or ""))
     if mid != load_config().get("image_mirror"):
         cfg = load_config()
@@ -1336,8 +1338,14 @@ def _custom_worker(job: dict, name: str, src: str, url: str, distro: str, releas
             rootfs = cdir / "rootfs"
             rootfs.mkdir()
             err = populate(rootfs)
+            if not err and distro == "nixos":  # 名称/地址里没有提示、解包后才发现是 NixOS
+                err = NIXOS_DIR_MSG
             if err:
-                return _custom_fail(job, name, err, cdir)
+                _custom_fail(job, name, err, cdir)
+                if err == NIXOS_DIR_MSG:  # NixOS 的 /var/empty 带不可变属性，先清除才删得掉
+                    run(["chattr", "-R", "-i", str(cdir)], timeout=600)
+                    shutil.rmtree(cdir, ignore_errors=True)
+                return
             rootfs_spec = f"dir:{rootfs}"
         # 4) 写配置
         _job_set(job, stage="生成容器配置", progress=92)
@@ -1375,6 +1383,9 @@ def _new_job(name: str) -> tuple[dict | None, str]:
     return job, ""
 
 
+NIXOS_DIR_MSG = "NixOS 不支持目录存储（fnOS 的 Btrfs trimacl 不遵循 umask，Nix 构建会被拒绝，且 rootfs 含不可变属性文件，目录难以删除），请选择 ext4 镜像"
+
+
 def _parse_storage(body: dict) -> tuple[str, int, str]:
     """前端传入的 storage=dir|loop 与 size_gb；返回 (storage, size_gb, 错误)。"""
     storage = "loop" if str(body.get("storage") or "dir") == "loop" else "dir"
@@ -1410,6 +1421,8 @@ def create_custom_container(body: dict) -> dict:
     storage, size_gb, err = _parse_storage(body)
     if err:
         return {"ok": False, "error": err}
+    if storage == "dir" and customfs.guess_distro(distro, url or src, name) == "nixos":
+        return {"ok": False, "error": NIXOS_DIR_MSG}
     job, err = _new_job(name)
     if not job:
         return {"ok": False, "error": err}

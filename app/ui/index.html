@@ -1309,6 +1309,7 @@
       $("#add-name").value = "";
       storageTouched = false;
       $("#add-reco").textContent = "";
+      $("#add-storage").querySelector('option[value="dir"]').disabled = false;
       loadCache();
       $("#add-mirror").innerHTML = "";
       await loadTemplates("");
@@ -1339,9 +1340,11 @@
     async function updateReco() {
       const k = recoText();
       const el = $("#add-reco");
+      $("#add-storage").querySelector('option[value="dir"]').disabled = !!k;  // NixOS 不允许目录存储
       if (!k) { el.textContent = ""; return; }
-      el.textContent = `推荐 ext4 镜像：${STRICT_PERM[k]}。`;
-      if (!storageTouched && $("#add-storage").value !== "loop") {
+      el.textContent = `${k === "nixos" ? "NixOS 只能使用" : "推荐"} ext4 镜像：${STRICT_PERM[k]}。`;
+      if (k === "nixos" || (!storageTouched && $("#add-storage").value !== "loop")) {
+        if ($("#add-storage").value === "loop") return;
         $("#add-storage").value = "loop";
         await $("#add-storage").onchange();
         const free = Math.floor(($("#add-size").max || 20));
