@@ -1677,7 +1677,10 @@
       dock.classList.toggle("hidden", termSessions.length === 0 || !modalHidden);
       dock.innerHTML = termSessions.map((s) =>
         `<div class="chip ${s.dead ? "dead" : ""}" data-id="${s.id}" title="点击恢复该终端"><span class="dot ${s.dead ? "off" : s.busy ? "new" : ""}"></span>终端 · ${esc(termLabel(s))}<span class="x" data-x="${s.id}" title="关闭该终端">✕</span></div>`).join("");
+      // 预留底部空间，避免悬浮的最小化标签盖住最后一行容器的按钮
+      document.body.style.paddingBottom = dock.classList.contains("hidden") ? "" : (dock.offsetHeight + 24) + "px";
     }
+    window.addEventListener("resize", () => { if (termSessions.length) termRenderDock(); });
     cv("term-dock").addEventListener("click", (e) => {
       const x = e.target.closest("[data-x]");
       if (x) { e.stopPropagation(); const s = termSessions.find((v) => v.id === Number(x.dataset.x)); if (s) termDestroy(s); return; }
