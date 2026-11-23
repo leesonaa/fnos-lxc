@@ -41,6 +41,10 @@ IPv4 设为静态时，会同时关闭容器内 **eth0** 的 DHCP（ifupdown / s
 （例如 NixOS 只发布 `rootfs.squashfs`，官方 download 模板拿不到）。解包前会拒绝绝对路径和 `..` 条目，单层顶级目录自动剥掉，
 发行版由 `/etc/os-release` 识别；若只有 `/init`（NixOS）会写 `lxc.init.cmd = /init`。需要带 init 的完整系统 rootfs，Docker 导出包通常无法启动。
 squashfs 优先用 `unsquashfs`，没有则 loop 挂载后拷贝。
+填下载地址时文件会缓存到 `<lxcpath>/cache/custom/`（按地址哈希命名，下载完成才落盘；用 HEAD 对比大小，一致则直接复用），
+同一地址创建多个容器只下载一次（同时创建时后到的任务等待第一个下载完成）；可在添加容器界面删除或清空缓存。
+发行版识别顺序：手填 → rootfs 内 os-release（按 rootfs 根解析符号链接，NixOS 的 `/etc/os-release` 是指向 `/etc/static` 的链接）→ 文件名/地址/容器名关键字。
+选了 NixOS 时会自动推荐 ext4 镜像存储。
 已停止的容器可「更多 → 导出 rootfs」，打包为 `<lxcpath>/exports/<名称>-时间.tar.gz`，可再用自定义 rootfs 导入。
 
 ## ext4 镜像存储（loop）
@@ -55,6 +59,10 @@ squashfs 优先用 `unsquashfs`，没有则 loop 挂载后拷贝。
 - 「更多 → 扩容」：停止状态下离线 `truncate → e2fsck → resize2fs`，只支持扩大。
 - 静态 IP 同步、导出 rootfs 会在容器停止时临时 loop 挂载镜像，运行中则通过 `/proc/<pid>/root` 访问；镜像已被占用时拒绝再次挂载。
 - 快照由 `lxc-snapshot` 处理 loop 后端（会复制镜像文件，注意磁盘空间）。
+
+## 网页终端
+
+可同时开多个终端；「最小化」后终端保持连接，收在页面左下角，点击恢复，有新输出会亮橙点；也可以直接再点「终端」另开一个。
 
 ## 打包
 

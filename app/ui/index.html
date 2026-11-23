@@ -219,13 +219,22 @@
       --text: #e8eaed; --muted: #a3a9b4; --border: rgba(255,255,255,.12);
       --btn: rgba(255,255,255,.09); --btn-hover: rgba(255,255,255,.17); --input-bg: rgba(0,0,0,.25);
     }
-    .term-box { flex: 1; min-height: 0; padding: 0; background: #0a0b0d; border-radius: 6px; overflow: hidden; }
+    .term-box { position: absolute; inset: 0; padding: 0; background: #0a0b0d; border-radius: 6px; overflow: hidden; }
     .term-box .xterm { height: 100%; }
     .term-box .xterm-viewport { background-color: transparent !important; scrollbar-width: thin; scrollbar-color: #3a4150 transparent; }
     .term-box .xterm-viewport::-webkit-scrollbar { width: 8px; }
     .term-box .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
     .term-box .xterm-viewport::-webkit-scrollbar-thumb { background: #3a4150; border-radius: 4px; }
     .term-box .xterm { padding: 6px 12px 6px 6px; }
+    .term-dock { position: fixed; left: 12px; bottom: 12px; z-index: 60; display: flex; gap: 6px; flex-wrap: wrap; max-width: calc(100vw - 24px); }
+    .term-dock .chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 999px; background: #0a0b0d; color: #d4d8de; border: 1px solid #3a4150; font-size: 13px; cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,.35); }
+    .term-dock .chip:hover { border-color: #3dd68c; }
+    .term-dock .chip.dead { opacity: .6; }
+    .term-dock .chip .dot { width: 8px; height: 8px; border-radius: 50%; background: #3dd68c; }
+    .term-dock .chip .dot.off { background: #777; }
+    .term-dock .chip .dot.new { background: #f5a524; }
+    .term-dock .chip .x { padding: 0 4px; border-radius: 4px; color: #9aa3b2; }
+    .term-dock .chip .x:hover { background: #3a4150; color: #fff; }
     .stat { white-space: nowrap; font-variant-numeric: tabular-nums; }
     .stat b { font-weight: 500; }
     .meter { height: 4px; width: 84px; margin: 4px auto 3px; border-radius: 2px; background: var(--pbar-bg); overflow: hidden; }
@@ -468,7 +477,8 @@
           <label>或填下载地址（填了则优先使用）</label>
           <input id="add-curl" placeholder="https://…/rootfs.tar.xz 或 rootfs.squashfs" style="width:100%" />
         </div>
-        <div class="field"><label>发行版标识（用于图标，可留空自动识别）</label><input id="add-cdistro" placeholder="如 nixos / debian" style="width:100%" /></div>
+        <div class="field"><label>发行版标识（用于图标；识别不出时可在这里选/填）</label><input id="add-cdistro" list="distro-list" placeholder="留空自动识别（依次看 os-release、文件名/地址、容器名）" style="width:100%" /><datalist id="distro-list"><option value="nixos"><option value="debian"><option value="ubuntu"><option value="alpine"><option value="archlinux"><option value="fedora"><option value="centos"><option value="rockylinux"><option value="almalinux"><option value="opensuse"><option value="kali"><option value="gentoo"><option value="void"><option value="openwrt"></datalist></div>
+        <div class="hint" id="add-cache" style="margin:0 0 8px"></div>
         <p class="hint">支持 .tar / .tar.gz / .tar.xz / .tar.zst / .tar.bz2 / .squashfs（如 NixOS 只发布 rootfs.squashfs）。必须是带 init 的完整系统 rootfs，且架构与本机一致（LXC 不能运行异构架构）；Docker 镜像导出的包通常无法启动。压缩包需来自可信来源。</p>
       </div>
       <div id="add-std">
@@ -491,6 +501,7 @@
           <option value="dir">目录（默认）</option>
           <option value="loop">ext4 镜像（loop）</option>
         </select>
+        <p class="hint" id="add-reco" style="margin:4px 0 0"></p>
       </div>
       <div class="field hidden" id="add-size-wrap">
         <label>镜像最大大小（GB，稀疏文件，用多少占多少）</label>
@@ -631,11 +642,13 @@
         <span class="hint" id="term-status" style="margin:0"></span>
         <div class="spacer"></div>
         <button id="term-reconnect" class="hidden">重新连接</button>
+        <button id="term-min" title="最小化：终端保持连接，可在底部切换回来，或另开新终端">最小化</button>
         <button id="term-close">关闭</button>
       </div>
-      <div class="term-box" id="term-box"></div>
+      <div id="term-boxes" style="flex:1;min-height:0;position:relative"></div>
     </div>
   </div>
+  <div class="term-dock hidden" id="term-dock"></div>
 
   <div class="menu hidden" id="more-menu"></div>
   <div class="toast hidden" id="toast"></div>
@@ -1294,6 +1307,9 @@
       $("#add-prog").classList.add("hidden");
       $("#add-log").classList.add("hidden");
       $("#add-name").value = "";
+      storageTouched = false;
+      $("#add-reco").textContent = "";
+      loadCache();
       $("#add-mirror").innerHTML = "";
       await loadTemplates("");
     };
@@ -1309,6 +1325,51 @@
         if (Number($("#add-size").value) > g) $("#add-size").value = String(Math.max(1, Math.floor(g / 2)));
       }
     };
+    // ----- 存储格式推荐 + 下载缓存 -----
+    // 对权限位严格、在 fnOS 的 Btrfs（trimacl）上会出问题的发行版，推荐 ext4 镜像
+    const STRICT_PERM = { nixos: "NixOS 的 Nix 构建要求输出目录权限严格，fnOS 的 Btrfs（trimacl）不遵循 umask，会被拒绝" };
+    let storageTouched = false;
+    function recoText() {
+      const parts = [$("#add-name").value, $("#add-cdistro").value, $("#add-curl").value, $("#add-cpath").value];
+      if (addMode === "std") parts.push($("#add-distro").value);
+      const t = parts.join(" ").toLowerCase();
+      for (const k of Object.keys(STRICT_PERM)) if (t.includes(k)) return k;
+      return "";
+    }
+    async function updateReco() {
+      const k = recoText();
+      const el = $("#add-reco");
+      if (!k) { el.textContent = ""; return; }
+      el.textContent = `推荐 ext4 镜像：${STRICT_PERM[k]}。`;
+      if (!storageTouched && $("#add-storage").value !== "loop") {
+        $("#add-storage").value = "loop";
+        await $("#add-storage").onchange();
+        const free = Math.floor(($("#add-size").max || 20));
+        if (Number($("#add-size").value) < 12) $("#add-size").value = String(Math.min(20, Math.max(1, free)));
+      }
+    }
+    ["add-name", "add-cdistro", "add-curl", "add-cpath"].forEach((id) => $("#" + id).addEventListener("input", updateReco));
+    $("#add-distro").addEventListener("change", updateReco);
+    $("#add-storage").addEventListener("change", (e) => { if (e.isTrusted) storageTouched = true; });
+    $("#add-mode").addEventListener("click", () => setTimeout(updateReco, 0));
+    function fmtSize(b) { return b >= 1073741824 ? (b / 1073741824).toFixed(1) + " GB" : Math.max(1, Math.round(b / 1048576)) + " MB"; }
+    async function loadCache() {
+      const c = await api("/api/custom-cache");
+      const el = $("#add-cache");
+      if (!c.ok || !c.items.length) { el.innerHTML = "填下载地址时，文件会缓存在本地，同一地址创建多个容器只下载一次。"; return; }
+      el.innerHTML = `已缓存 ${c.items.length} 个文件（${fmtSize(c.total)}），相同地址直接复用：` +
+        c.items.map((i) => `<div style="margin:2px 0">· ${esc((i.url || i.file).split("/").slice(-4).join("/"))}（${fmtSize(i.size)}） ` +
+          `<a href="#" data-cache="${esc(i.file)}">删除</a></div>`).join("") +
+        `<div><a href="#" data-cache="">清空全部缓存</a></div>`;
+    }
+    $("#add-cache").addEventListener("click", async (e) => {
+      const a = e.target.closest("a[data-cache]");
+      if (!a) return;
+      e.preventDefault();
+      if (!confirm(a.dataset.cache ? "删除该缓存文件？" : "清空全部下载缓存？（已创建的容器不受影响）")) return;
+      await api("/api/custom-cache/clear", { method: "POST", body: a.dataset.cache ? { file: a.dataset.cache } : {} });
+      loadCache();
+    });
     $("#add-cancel").onclick = () => $("#modal-add").classList.add("hidden");
     $("#add-ok").onclick = async () => {
       const name = $("#add-name").value.trim();
@@ -1514,67 +1575,120 @@
       if (r.ok) openConfig(cfgName);
     };
 
-    // ----- web terminal (xterm.js + WebSocket PTY) -----
-    let term = null, fit = null, ws = null, termName = "", ro = null;
-    function termSendResize() {
-      if (ws && ws.readyState === 1 && term) ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
+    // ----- web terminal (xterm.js + WebSocket PTY)：支持多会话、最小化 -----
+    const termSessions = [];
+    let termActive = null, termIdSeq = 0;
+    function termLabel(s) {
+      const same = termSessions.filter((x) => x.name === s.name);
+      return same.length > 1 ? `${s.name} (${same.indexOf(s) + 1})` : s.name;
     }
-    let termSeq = 0;
-    async function termConnect() {
-      const seq = ++termSeq;
-      if (ws) { try { ws.close(); } catch (e) {} }
-      cv("term-reconnect").classList.add("hidden");
-      cv("term-status").textContent = "连接中…";
-      fit.fit();
-      const t = await api("/api/container/term-token", { method: "POST", body: { name: termName } });
-      if (seq !== termSeq) return;
-      if (!t.ok) {
-        cv("term-status").textContent = t.error || "认证失败";
-        cv("term-reconnect").classList.remove("hidden");
-        return;
+    function termSendResize(s) {
+      if (s.ws && s.ws.readyState === 1) s.ws.send(JSON.stringify({ type: "resize", cols: s.term.cols, rows: s.term.rows }));
+    }
+    function termShowStatus(s, text, canReconnect) {
+      s.status = text;
+      s.canReconnect = !!canReconnect;
+      if (s === termActive) {
+        cv("term-status").textContent = text || "";
+        cv("term-reconnect").classList.toggle("hidden", !s.canReconnect);
       }
+    }
+    function termRenderDock() {
+      const dock = cv("term-dock");
+      const modalHidden = cv("modal-term").classList.contains("hidden");
+      dock.classList.toggle("hidden", termSessions.length === 0 || !modalHidden);
+      dock.innerHTML = termSessions.map((s) =>
+        `<div class="chip ${s.dead ? "dead" : ""}" data-id="${s.id}" title="点击恢复该终端"><span class="dot ${s.dead ? "off" : s.unread ? "new" : ""}"></span>终端 · ${esc(termLabel(s))}<span class="x" data-x="${s.id}" title="关闭该终端">✕</span></div>`).join("");
+    }
+    cv("term-dock").addEventListener("click", (e) => {
+      const x = e.target.closest("[data-x]");
+      if (x) { e.stopPropagation(); const s = termSessions.find((v) => v.id === Number(x.dataset.x)); if (s) termDestroy(s); return; }
+      const c = e.target.closest(".chip");
+      if (c) { const s = termSessions.find((v) => v.id === Number(c.dataset.id)); if (s) termActivate(s); }
+    });
+    function termActivate(s) {
+      termActive = s;
+      s.unread = false;
+      cv("modal-term").classList.remove("hidden");
+      termSessions.forEach((v) => { v.el.style.display = v === s ? "" : "none"; });
+      cv("term-title").textContent = `终端 · ${termLabel(s)}`;
+      cv("term-status").textContent = s.status || "";
+      cv("term-reconnect").classList.toggle("hidden", !s.canReconnect);
+      termRenderDock();
+      requestAnimationFrame(() => { try { s.fit.fit(); } catch (e) {} s.term.focus(); });
+    }
+    function termMinimize() {
+      cv("modal-term").classList.add("hidden");
+      termRenderDock();
+    }
+    function termDestroy(s) {
+      s.closed = true;
+      if (s.ws) { const w = s.ws; s.ws = null; try { w.close(); } catch (e) {} }
+      if (s.ro) { s.ro.disconnect(); s.ro = null; }
+      try { s.term.dispose(); } catch (e) {}
+      s.el.remove();
+      termSessions.splice(termSessions.indexOf(s), 1);
+      if (termActive === s) {
+        termActive = null;
+        if (termSessions.length && !cv("modal-term").classList.contains("hidden")) termActivate(termSessions[termSessions.length - 1]);
+        else cv("modal-term").classList.add("hidden");
+      }
+      termRenderDock();
+    }
+    async function termConnect(s) {
+      const seq = ++s.seq;
+      if (s.ws) { const old = s.ws; s.ws = null; try { old.close(); } catch (e) {} }
+      s.dead = false;
+      termShowStatus(s, "连接中…", false);
+      try { s.fit.fit(); } catch (e) {}
+      const t = await api("/api/container/term-token", { method: "POST", body: { name: s.name } });
+      if (s.closed || seq !== s.seq) return;
+      if (!t.ok) { s.dead = true; termShowStatus(s, t.error || "认证失败", true); termRenderDock(); return; }
       const proto = location.protocol === "https:" ? "wss" : "ws";
       const base = new URL(document.baseURI).pathname.replace(/\/$/, "");
-      ws = new WebSocket(`${proto}://${location.host}${base}/api/container/${encodeURIComponent(termName)}/term?token=${encodeURIComponent(t.token)}&cols=${term.cols}&rows=${term.rows}`);
+      const ws = new WebSocket(`${proto}://${location.host}${base}/api/container/${encodeURIComponent(s.name)}/term?token=${encodeURIComponent(t.token)}&cols=${s.term.cols}&rows=${s.term.rows}`);
       ws.binaryType = "arraybuffer";
-      const mine = ws;
-      ws.onopen = () => { cv("term-status").textContent = ""; term.focus(); };
-      ws.onmessage = (e) => { if (e.data instanceof ArrayBuffer) term.write(new Uint8Array(e.data)); };
+      s.ws = ws;
+      ws.onopen = () => { termShowStatus(s, "", false); if (s === termActive) s.term.focus(); termRenderDock(); };
+      ws.onmessage = (e) => {
+        if (!(e.data instanceof ArrayBuffer)) return;
+        s.term.write(new Uint8Array(e.data));
+        if (s !== termActive || cv("modal-term").classList.contains("hidden")) {
+          if (!s.unread) { s.unread = true; termRenderDock(); }
+        }
+      };
       ws.onclose = () => {
-        if (mine !== ws) return;
-        term.write("\r\n\x1b[90m[连接已关闭]\x1b[0m\r\n");
-        cv("term-status").textContent = "已断开";
-        cv("term-reconnect").classList.remove("hidden");
+        if (s.closed || ws !== s.ws) return;
+        s.term.write("\r\n\x1b[90m[连接已关闭]\x1b[0m\r\n");
+        s.dead = true;
+        termShowStatus(s, "已断开", true);
+        termRenderDock();
       };
     }
     function openTerm(name) {
-      termName = name;
-      cv("term-title").textContent = `终端 · ${name}`;
-      cv("modal-term").classList.remove("hidden");
-      if (term) { term.dispose(); }
-      cv("term-box").textContent = "";
-      term = new Terminal({
+      const s = { id: ++termIdSeq, name, seq: 0, el: document.createElement("div"), unread: false, dead: false, status: "", canReconnect: false };
+      s.el.className = "term-box";
+      cv("term-boxes").appendChild(s.el);
+      termSessions.push(s);
+      termActivate(s);  // 先显示容器，xterm 才能量出尺寸
+      s.term = new Terminal({
         cursorBlink: true, fontSize: 14, scrollback: 5000, allowProposedApi: true,
         fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace',
         theme: { background: "#0a0b0d", foreground: "#d4d8de", cursor: "#3dd68c" },
       });
-      fit = new FitAddon.FitAddon();
-      term.loadAddon(fit);
-      term.open(cv("term-box"));
-      term.onData((d) => { if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode(d)); });
-      term.onResize(termSendResize);
-      if (ro) ro.disconnect();
-      ro = new ResizeObserver(() => { try { fit.fit(); } catch (e) {} });
-      ro.observe(cv("term-box"));
-      requestAnimationFrame(() => { try { fit.fit(); } catch (e) {} termConnect(); });
+      s.fit = new FitAddon.FitAddon();
+      s.term.loadAddon(s.fit);
+      s.term.open(s.el);
+      s.term.onData((d) => { if (s.ws && s.ws.readyState === 1) s.ws.send(new TextEncoder().encode(d)); });
+      s.term.onResize(() => termSendResize(s));
+      s.ro = new ResizeObserver(() => { if (s === termActive) { try { s.fit.fit(); } catch (e) {} } });
+      s.ro.observe(s.el);
+      requestAnimationFrame(() => { try { s.fit.fit(); } catch (e) {} termConnect(s); });
+      termRenderDock();
     }
-    cv("term-reconnect").onclick = termConnect;
-    cv("term-close").onclick = () => {
-      cv("modal-term").classList.add("hidden");
-      if (ws) { const w = ws; ws = null; try { w.close(); } catch (e) {} }
-      if (ro) { ro.disconnect(); ro = null; }
-      if (term) { term.dispose(); term = null; }
-    };
+    cv("term-reconnect").onclick = () => { if (termActive) termConnect(termActive); };
+    cv("term-min").onclick = termMinimize;
+    cv("term-close").onclick = () => { if (termActive) termDestroy(termActive); };
 
     // boot
     (async () => {

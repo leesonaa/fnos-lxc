@@ -94,7 +94,7 @@ def build_config(name: str, rootfs_spec: str, distro: str, release: str, arch: s
                  default_conf: str, include_path: str, init_cmd: str = "") -> str:
     lines = [
         "# Template used to create this container: custom-rootfs (fnos-lxc)",
-        f"# Parameters passed to the template: -d {distro or 'linux'}" + (f" -r {release}" if release else ""),
+        *([f"# Parameters passed to the template: -d {distro}" + (f" -r {release}" if release else "")] if distro else []),
         f"lxc.include = {include_path}",
         f"lxc.arch = {ARCH_MAP.get(arch, arch) or 'x86_64'}",
     ]
@@ -113,17 +113,37 @@ _ELF_MACHINE = {0x3E: "x86_64", 0xB7: "aarch64", 0x28: "armv7l", 0x03: "i686", 0
 _ELF_PROBES = ("bin/sh", "usr/bin/env", "bin/busybox", "sbin/init", "usr/bin/sh", "bin/ls", "usr/bin/ls")
 
 
-def resolve_in_root(root, rel: str, depth: int = 12):
-    """在 rootfs 内解析符号链接（绝对链接按 rootfs 根解释），返回真实文件 Path 或 None。"""
+def resolve_in_root(root, rel: str, depth: int = 40):
+    """在 rootfs 内逐段解析路径（含中间目录的符号链接；绝对链接按 rootfs 根解释，.. 不会越出 rootfs）。
+    返回真实文件 Path 或 None。"""
+    import os
     from pathlib import Path
     root = Path(root)
-    cur = root / rel
-    for _ in range(depth):
-        if not cur.is_symlink():
-            return cur if cur.is_file() else None
-        t = cur.readlink() if hasattr(cur, "readlink") else Path(__import__("os").readlink(cur))
-        cur = root / str(t).lstrip("/") if str(t).startswith("/") else cur.parent / t
-    return None
+    cur = root
+    parts = [x for x in rel.split("/") if x]
+    budget = depth
+    while parts:
+        p = parts.pop(0)
+        if p == ".":
+            continue
+        if p == "..":
+            cur = cur.parent if cur != root else root
+            continue
+        nxt = cur / p
+        if nxt.is_symlink():
+            budget -= 1
+            if budget < 0:
+                return None
+            try:
+                t = os.readlink(nxt)
+            except OSError:
+                return None
+            if t.startswith("/"):
+                cur = root
+            parts = [x for x in t.split("/") if x] + parts
+        else:
+            cur = nxt
+    return cur if cur.is_file() else None
 
 
 def elf_arch(root) -> str:
@@ -151,3 +171,53 @@ def arch_compatible(host: str, guest: str) -> bool:
     if not guest or host == guest:
         return True
     return host == "x86_64" and guest == "i686"  # x86_64 内核可运行 32 位 x86 用户态
+
+
+# ---------------------------------------------------------------- 发行版识别
+# (关键字, 图标用的发行版名)；先匹配更具体的名字
+_DISTRO_HINTS = [
+    ("nixos", "nixos"), ("immortalwrt", "openwrt"), ("openwrt", "openwrt"), ("alpine", "alpine"),
+    ("archlinux", "archlinux"), (r"(?<![a-z])arch(?![a-z])", "archlinux"), ("rocky", "rockylinux"),
+    ("almalinux", "almalinux"), (r"(?<![a-z])alma(?![a-z])", "almalinux"), ("centos", "centos"),
+    ("fedora", "fedora"), ("ubuntu", "ubuntu"), ("debian", "debian"), (r"(?<![a-z])kali(?![a-z])", "kali"),
+    (r"(?<![a-z])mint(?![a-z])", "mint"), ("gentoo", "gentoo"), (r"(?<![a-z])void(?![a-z])", "void"),
+    ("opensuse", "opensuse"), (r"(?<![a-z])suse(?![a-z])", "opensuse"), ("rhel", "rhel"), ("redhat", "rhel"),
+]
+
+
+def guess_distro(*texts: str) -> str:
+    """从文件名 / URL / 容器名 / os-release 的 ID 等文字里猜发行版；猜不到返回 ''。"""
+    for t in texts:
+        low = (t or "").lower()
+        if not low:
+            continue
+        for pat, name in _DISTRO_HINTS:
+            if re.search(pat, low):
+                return name
+    return ""
+
+
+def read_os_release(root) -> dict:
+    """读取 rootfs 内的 os-release（按 rootfs 根解析符号链接——NixOS 的 /etc/os-release 是指向 /etc/static 的绝对链接）。"""
+    for rel in ("etc/os-release", "usr/lib/os-release", "etc/static/os-release"):
+        f = resolve_in_root(root, rel)
+        if not f:
+            continue
+        try:
+            text = f.read_text(errors="ignore")
+        except OSError:
+            continue
+        out = {}
+        for ln in text.splitlines():
+            m = re.match(r'^([A-Z_]+)=(?:"([^"]*)"|\'([^\']*)\'|(\S*))\s*$', ln.strip())
+            if m:
+                out[m.group(1)] = m.group(2) or m.group(3) or m.group(4) or ""
+        if out:
+            return out
+    return {}
+
+
+def distro_from_os_release(info: dict) -> str:
+    """ID → 图标发行版名；认不出就返回小写 ID 本身。"""
+    i = (info.get("ID") or "").lower()
+    return guess_distro(i, info.get("ID_LIKE", "") if not i else "") or i

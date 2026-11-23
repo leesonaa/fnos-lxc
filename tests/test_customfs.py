@@ -63,6 +63,36 @@ class CustomFsTests(unittest.TestCase):
         self.assertFalse(customfs.arch_compatible("arm64", "armv7l"))
         self.assertEqual(customfs.elf_arch(Path(tempfile.mkdtemp())), "")
 
+    def test_guess_distro(self):
+        g = customfs.guess_distro
+        self.assertEqual(g("https://x/images/nixos/26.05/arm64/default/rootfs.squashfs"), "nixos")
+        self.assertEqual(g("", "my-debian12"), "debian")
+        self.assertEqual(g("aarch64-rootfs.tar"), "")          # aarch64 不是 arch
+        self.assertEqual(g("arch-bootstrap.tar.zst"), "archlinux")
+        self.assertEqual(g("immortalwrt-armsr.tar.gz"), "openwrt")
+        self.assertEqual(g("minting"), "")
+        self.assertEqual(customfs.distro_from_os_release({"ID": "opensuse-leap"}), "opensuse")
+        self.assertEqual(customfs.distro_from_os_release({"ID": "weirdos"}), "weirdos")
+
+    def test_read_os_release_nixos_symlinks(self):
+        import tempfile, os
+        d = Path(tempfile.mkdtemp())
+        (d / "etc").mkdir()
+        (d / "nix/store/abc-etc/etc").mkdir(parents=True)
+        (d / "nix/store/abc-etc/etc/os-release").write_text('ID=nixos\nVERSION_ID="26.05"\nNAME=NixOS\n')
+        os.symlink("/nix/store/abc-etc/etc", d / "etc/static")            # 目录符号链接，宿主机上悬空
+        os.symlink("/etc/static/os-release", d / "etc/os-release")        # 链接再经过链接
+        info = customfs.read_os_release(d)
+        self.assertEqual(info.get("ID"), "nixos")
+        self.assertEqual(info.get("VERSION_ID"), "26.05")
+        # .. 不能越出 rootfs
+        os.symlink("../../../../../../etc/passwd", d / "etc/evil")
+        self.assertIsNone(customfs.resolve_in_root(d, "etc/evil"))
+
+    def test_config_without_distro(self):
+        t = customfs.build_config("n", "dir:/r", "", "", "amd64", "", "/c.conf")
+        self.assertNotIn("Parameters passed", t)
+
 
 if __name__ == "__main__":
     unittest.main()

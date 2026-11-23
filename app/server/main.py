@@ -380,23 +380,19 @@ def detect_distro(name: str) -> tuple[str, str]:
     distro, release = "", ""
     if p:
         try:
-            distro, release = lxcconf.parse_distro(p.read_text(errors="ignore"))
+            text = p.read_text(errors="ignore")
+            distro, release = lxcconf.parse_distro(text)
+            if distro == "linux":  # 旧版本在未识别时写入的占位值
+                distro = ""
+            if not distro and rootstore.parse_rootfs(text)[0] == "dir":
+                # 只读 dir 存储（loop 镜像不在列表刷新时挂载）；按 rootfs 根解析符号链接
+                info = customfs.read_os_release(rootstore.parse_rootfs(text)[1])
+                distro = customfs.distro_from_os_release(info)
+                release = release or info.get("VERSION_ID", "")
         except OSError:
             pass
-        if not distro:
-            osr = p.parent / "rootfs" / "etc" / "os-release"
-            try:
-                m = re.search(r'^ID="?([A-Za-z0-9._-]+)"?', osr.read_text(errors="ignore"), re.M)
-                if m:
-                    distro = m.group(1).lower()
-            except OSError:
-                pass
     if not distro:
-        for d in ("debian", "ubuntu", "alpine", "centos", "fedora", "archlinux", "opensuse",
-                  "rockylinux", "almalinux", "kali", "mint", "gentoo", "nixos", "openwrt"):
-            if d in name.lower():
-                distro = d
-                break
+        distro = customfs.guess_distro(name)
     return distro or "linux", release
 
 
@@ -1154,35 +1150,118 @@ def _extract_squash(job: dict, src: str, dst: Path) -> str:
         shutil.rmtree(mnt, ignore_errors=True)
 
 
+_DL_LOCKS: dict = {}
+_DL_GUARD = threading.Lock()
+
+
+def _cache_dir() -> Path:
+    return lxc_base() / "cache" / "custom"
+
+
+def _cache_path(url: str) -> Path:
+    return _cache_dir() / (hashlib.sha256(url.encode()).hexdigest()[:16] + customfs.ext_of(url))
+
+
+def _remote_size(url: str) -> int:
+    try:
+        with _http(url, "HEAD", timeout=20) as h:
+            return int(h.headers.get("Content-Length") or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _fetch_cached(job: dict, url: str, t0: float) -> tuple[Path | None, str]:
+    """返回 (本地文件, 错误)。已缓存且大小与服务器一致（或服务器不可达）时直接复用。"""
+    path = _cache_path(url)
+    with _DL_GUARD:
+        lock = _DL_LOCKS.setdefault(str(path), threading.Lock())
+    _job_set(job, stage="检查本地缓存", progress=4)
+    with lock:  # 同一地址的多个任务排队：第一个下载，其余直接用缓存
+        remote = _remote_size(url)
+        if path.is_file() and path.stat().st_size > 0 and (not remote or path.stat().st_size == remote):
+            with _JOBS_LOCK:
+                job["log"] = (job["log"] + [f"使用本地缓存：{path.name}（{path.stat().st_size >> 20} MB）"])[-30:]
+            _job_set(job, progress=50)
+            return path, ""
+        free = _free_bytes(lxc_base())
+        if remote and free and remote > free:
+            return None, f"磁盘空间不足：文件 {remote >> 20} MB，剩余 {free >> 20} MB"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        part = path.with_name(path.name + ".part")
+        _job_set(job, stage="下载 rootfs", progress=5)
+        try:
+            with _http(url, "GET", timeout=60) as resp, open(part, "wb") as f:
+                total = int(resp.headers.get("Content-Length") or 0)
+                _job_set(job, total=total)
+                got = 0
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+                    _job_set(job, downloaded=got, elapsed=int(time.time() - t0),
+                             progress=5 + (min(45, int(got * 45 / total)) if total else 0))
+            if total and got != total:
+                raise OSError(f"下载不完整（{got}/{total} 字节）")
+            os.replace(part, path)
+            path.with_name(path.name + ".url").write_text(url + "\n")
+        except Exception as e:  # noqa: BLE001
+            part.unlink(missing_ok=True)
+            return None, f"下载失败：{e}"
+    return path, ""
+
+
+def cache_list() -> dict:
+    d = _cache_dir()
+    items = []
+    if d.is_dir():
+        for f in sorted(d.iterdir()):
+            if f.suffix in (".part", ".url") or not f.is_file():
+                continue
+            try:
+                url = f.with_name(f.name + ".url").read_text().strip()
+            except OSError:
+                url = ""
+            items.append({"file": f.name, "url": url, "size": f.stat().st_size, "mtime": int(f.stat().st_mtime)})
+    return {"ok": True, "items": items, "total": sum(i["size"] for i in items)}
+
+
+def cache_clear(body: dict) -> dict:
+    d = _cache_dir()
+    if not d.is_dir():
+        return {"ok": True, "removed": 0}
+    one = str(body.get("file") or "")
+    if one and (os.path.basename(one) != one or one.endswith((".part", ".url"))):
+        return {"ok": False, "error": "文件名无效"}
+    removed = 0
+    for f in list(d.iterdir()):
+        if one and f.name != one:
+            continue
+        if f.suffix == ".part" or f.name.endswith(".url") or not f.is_file():
+            continue
+        with _DL_GUARD:
+            lock = _DL_LOCKS.get(str(f))
+        if lock and lock.locked():
+            continue  # 正在被下载/校验
+        f.unlink(missing_ok=True)
+        f.with_name(f.name + ".url").unlink(missing_ok=True)
+        removed += 1
+    return {"ok": True, "removed": removed}
+
+
 def _custom_worker(job: dict, name: str, src: str, url: str, distro: str, release: str, arch: str, autostart: bool,
                    storage: str = "dir", size_gb: int = 0) -> None:
     t0 = time.time()
     cdir = lxc_base() / name
-    downloaded = None
+    src_hint = url or src
     try:
-        # 1) 取得本地文件
+        # 1) 取得本地文件（URL 走本地缓存：同一地址只下载一次，多个容器共用）
         if url:
-            ext = customfs.ext_of(url)
-            cache = lxc_base() / "cache" / "custom"
-            cache.mkdir(parents=True, exist_ok=True)
-            downloaded = cache / f"{name}{ext}"
-            _job_set(job, stage="下载 rootfs", progress=5)
-            try:
-                with _http(url, "GET", timeout=60) as resp, open(downloaded, "wb") as f:
-                    total = int(resp.headers.get("Content-Length") or 0)
-                    _job_set(job, total=total)
-                    got = 0
-                    while True:
-                        chunk = resp.read(1 << 20)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        got += len(chunk)
-                        _job_set(job, downloaded=got, elapsed=int(time.time() - t0),
-                                 progress=5 + (min(45, int(got * 45 / total)) if total else 0))
-            except Exception as e:  # noqa: BLE001
-                return _custom_fail(job, name, f"下载失败：{e}")
-            src = str(downloaded)
+            path, err = _fetch_cached(job, url, t0)
+            if err:
+                return _custom_fail(job, name, err)
+            src = str(path)
         kind = customfs.classify(src)
         size = os.path.getsize(src)
         free = _free_bytes(lxc_base())
@@ -1210,7 +1289,7 @@ def _custom_worker(job: dict, name: str, src: str, url: str, distro: str, releas
         # 3) 解包（dir：直接解到目录；loop：先建 ext4 镜像并挂载，再解进去）
         def populate(rootfs: Path) -> str:
             """解包 + 架构/init 检查；返回错误信息，成功返回 ''。结果通过 nonlocal 带出。"""
-            nonlocal distro, init_kind
+            nonlocal distro, release, init_kind
             _job_set(job, stage="解包 rootfs（可能需要几分钟）", progress=55)
             if kind == "tar":
                 argv = ["tar", "--numeric-owner", "--xattrs", "-xpf", src, "-C", str(rootfs)]
@@ -1230,12 +1309,11 @@ def _custom_worker(job: dict, name: str, src: str, url: str, distro: str, releas
             if guest_arch and not customfs.arch_compatible(arch, guest_arch):
                 return f"rootfs 是 {guest_arch} 架构，而本机是 {customfs.ARCH_MAP.get(arch, arch)}：LXC 不能运行异构架构的容器"
             init_kind = customfs.init_kind(lambda rel: (rootfs / rel).exists() or (rootfs / rel).is_symlink())
+            info = customfs.read_os_release(rootfs)
             if not distro:
-                try:
-                    m = re.search(r'^ID="?([A-Za-z0-9._-]+)"?', (rootfs / "etc/os-release").read_text(errors="ignore"), re.M)
-                    distro = m.group(1).lower() if m else ""
-                except OSError:
-                    pass
+                distro = customfs.distro_from_os_release(info) or customfs.guess_distro(src_hint, name)
+            if not release:
+                release = info.get("VERSION_ID", "")
             return ""
 
         init_kind = ""
@@ -1282,12 +1360,6 @@ def _custom_worker(job: dict, name: str, src: str, url: str, distro: str, releas
         oplog.log("container.create_custom", ok=True, name=name, distro=distro, detail=Path(src).name, storage=storage)
     except Exception as e:  # noqa: BLE001
         _custom_fail(job, name, f"{type(e).__name__}: {e}", cdir)
-    finally:
-        if downloaded:
-            try:
-                downloaded.unlink()
-            except OSError:
-                pass
 
 
 def _new_job(name: str) -> tuple[dict | None, str]:
@@ -2035,6 +2107,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, storage_info())
             return
 
+        if path == "/api/custom-cache":
+            self._json(200, cache_list())
+            return
+
         m = re.match(r"^/api/container/([^/]+)/snapshots$", path)
         if m:
             self._json(200, list_snapshots(m.group(1)))
@@ -2064,6 +2140,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/container/create-custom":
             self._json(200, create_custom_container(body))
+            return
+
+        if path == "/api/custom-cache/clear":
+            self._json(200, cache_clear(body))
             return
 
         m = re.match(r"^/api/container/([^/]+)/resize$", path)
