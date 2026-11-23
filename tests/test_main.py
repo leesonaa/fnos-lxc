@@ -183,3 +183,36 @@ class IconTests(unittest.TestCase):
         for bad in ("../x.png", "a/b.png", "x.exe", ".." + "/" * 2 + "etc.png"):
             self.assertIsNone(main.read_icon(bad))
         main.cleanup_icons("web", "")
+
+    def test_url_fetch(self):
+        import http.server, threading
+        PNG = self.PNG
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = {"/a": PNG, "/t.txt": b"hello", "/big": PNG + b"0" * 400000}.get(self.path)
+                if body is None:
+                    self.send_response(404); self.end_headers(); return
+                self.send_response(200); self.end_headers(); self.wfile.write(body)
+            def log_message(self, *a): pass
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        try:
+            # 回环地址默认被拒绝
+            self.assertFalse(main.save_container_icon("web", {"url": base + "/a"})["ok"])
+            orig = main._icon_host_ok
+            main._icon_host_ok = lambda u: ""
+            try:
+                r = main.save_container_icon("web", {"url": base + "/a"})
+                self.assertTrue(r["ok"], r)
+                self.assertTrue(r["icon"].endswith(".png"))
+                self.assertFalse(main.save_container_icon("web", {"url": base + "/t.txt"})["ok"])   # 不是图片
+                self.assertFalse(main.save_container_icon("web", {"url": base + "/big"})["ok"])     # 太大
+                self.assertFalse(main.save_container_icon("web", {"url": base + "/none"})["ok"])    # 404
+            finally:
+                main._icon_host_ok = orig
+            self.assertFalse(main.save_container_icon("web", {"url": "ftp://x/a.png"})["ok"])
+        finally:
+            srv.shutdown()
+            main.cleanup_icons("web", "")
+

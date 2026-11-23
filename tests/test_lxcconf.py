@@ -99,3 +99,21 @@ class IconSettingTests(unittest.TestCase):
     def test_invalid(self):
         for ic in ("custom:../x.png", "custom:x.exe", "builtin:a b", "http://x/y.png", "custom:/etc/passwd.png"):
             self.assertNotEqual(self._roundtrip(ic)[1], "", ic)
+
+
+class Ipv6OffTests(unittest.TestCase):
+    def test_off_roundtrip(self):
+        base = "lxc.rootfs.path = dir:/x\n"
+        s = lxcconf.parse_settings(base)
+        v, err = lxcconf.validate(dict(s, ipv6_mode="off", ipv6_address="fd00::1/64", bridge="br0"))
+        self.assertEqual(err, "")
+        text = lxcconf.apply_settings(base, v)
+        self.assertIn("lxc.sysctl.net.ipv6.conf.all.disable_ipv6 = 1", text)
+        p = lxcconf.parse_settings(text)
+        self.assertEqual((p["ipv6_mode"], p["ipv6_address"]), ("off", ""))
+        # 改回自动：sysctl 行被清除
+        v2, _ = lxcconf.validate(dict(p, ipv6_mode="auto", bridge="br0"))
+        text2 = lxcconf.apply_settings(text, v2)
+        self.assertNotIn("disable_ipv6", text2)
+        self.assertEqual(lxcconf.parse_settings(text2)["ipv6_mode"], "auto")
+

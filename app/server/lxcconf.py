@@ -28,6 +28,8 @@ _STRIP_KEYS = {
     "lxc.net.0.ipv4.gateway",
     "lxc.net.0.ipv6.address",
     "lxc.net.0.ipv6.gateway",
+    "lxc.sysctl.net.ipv6.conf.all.disable_ipv6",
+    "lxc.sysctl.net.ipv6.conf.default.disable_ipv6",
     "lxc.cgroup2.cpu.max",
     "lxc.cgroup2.memory.max",
 }
@@ -59,7 +61,7 @@ DEFAULTS = {
     "ipv4_mode": "dhcp",  # dhcp | static
     "ipv4_address": "",
     "ipv4_gateway": "",
-    "ipv6_mode": "auto",  # auto | static
+    "ipv6_mode": "auto",  # auto | static | off（off=容器内禁用 IPv6）
     "ipv6_address": "",
     "ipv6_gateway": "",
     "cpu_cores": 0,  # 0 = 不限
@@ -142,6 +144,9 @@ def parse_settings(text: str) -> dict:
                 s["ipv6_address"] = v
         elif k == "lxc.net.0.ipv6.gateway":
             s["ipv6_gateway"] = v
+        elif k == "lxc.sysctl.net.ipv6.conf.all.disable_ipv6":
+            if v == "1" and not s["ipv6_address"]:
+                s["ipv6_mode"] = "off"
         elif k == "lxc.cgroup2.cpu.max":
             m = re.match(r"^(\d+)\s+(\d+)$", v)
             if m and int(m.group(2)) > 0:
@@ -253,7 +258,9 @@ def validate(raw: dict) -> tuple[dict | None, str]:
                 return None, "IPv4 网关无效"
         s.update(ipv4_mode="static", ipv4_address=str(iface), ipv4_gateway=gw)
 
-    if raw.get("ipv6_mode") == "static":
+    if raw.get("ipv6_mode") == "off":
+        s.update(ipv6_mode="off", ipv6_address="", ipv6_gateway="")
+    elif raw.get("ipv6_mode") == "static":
         try:
             iface6 = ipaddress.IPv6Interface(str(raw.get("ipv6_address") or "").strip())
             if "/" not in str(raw.get("ipv6_address")):
@@ -371,6 +378,9 @@ def build_block(s: dict, bind_is_file=lambda p: False) -> list[str]:
         L.append(f"lxc.net.0.ipv6.address = {s['ipv6_address']}")
         if s["ipv6_gateway"]:
             L.append(f"lxc.net.0.ipv6.gateway = {s['ipv6_gateway']}")
+    if s["ipv6_mode"] == "off":
+        L.append("lxc.sysctl.net.ipv6.conf.all.disable_ipv6 = 1")
+        L.append("lxc.sysctl.net.ipv6.conf.default.disable_ipv6 = 1")
     if s["cpu_cores"] and s["cpu_cores"] > 0:
         L.append(f"lxc.cgroup2.cpu.max = {int(round(s['cpu_cores'] * 100000))} 100000")
     if s["memory_mb"] and s["memory_mb"] > 0:

@@ -21,6 +21,7 @@ import subprocess
 import termios
 import threading
 import time
+import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1549,26 +1550,90 @@ def _icon_dir() -> Path:
     return DATA_DIR / "icons"
 
 
+def _sniff_icon_ext(data: bytes) -> str:
+    """按文件头判断图片类型，不信任 URL 扩展名；认不出返回空串。"""
+    for ext, magic in ICON_EXTS.items():
+        if data.startswith(magic) and (ext != "webp" or data[8:12] == b"WEBP"):
+            return ext
+    if b"<svg" in data[:4096].lower():
+        return "svg"
+    return ""
+
+
+def _icon_host_ok(url: str) -> str:
+    """拒绝回环/链路本地/未指定地址（局域网图床仍然允许）；返回错误文本，空串表示通过。"""
+    import ipaddress
+    import socket
+    from urllib.parse import urlsplit
+
+    sp = urlsplit(url)
+    if sp.scheme not in ("http", "https") or not sp.hostname:
+        return "URL 必须是 http(s):// 开头的地址"
+    try:
+        infos = socket.getaddrinfo(sp.hostname, sp.port or (443 if sp.scheme == "https" else 80), proto=socket.IPPROTO_TCP)
+    except OSError:
+        return "无法解析该地址的主机名"
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast:
+            return "不允许使用本机或链路本地地址"
+    return ""
+
+
+def _download_icon(url: str) -> tuple:
+    import urllib.request
+
+    err = _icon_host_ok(url)
+    if err:
+        return None, err
+
+    class _Redir(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            if _icon_host_ok(newurl):
+                raise urllib.error.HTTPError(newurl, code, "重定向目标不允许", headers, fp)
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    opener = urllib.request.build_opener(_Redir)
+    req = urllib.request.Request(url, headers={"User-Agent": "fnos-lxc"})
+    try:
+        with opener.open(req, timeout=15) as r:
+            data = r.read(ICON_MAX + 1)
+    except Exception as e:  # noqa: BLE001
+        return None, f"下载失败：{str(e)[:120]}"
+    if len(data) > ICON_MAX:
+        return None, f"图片不能超过 {ICON_MAX // 1024} KB"
+    return data, ""
+
+
 def save_container_icon(name: str, body: dict) -> dict:
     name = clean_name(name)
     if not name or not ct_config_path(name):
         return {"ok": False, "error": "容器不存在"}
-    ext = str(body.get("ext") or "").lower().lstrip(".")
-    ext = "jpg" if ext == "jpeg" else ext
-    if ext not in ICON_TYPES:
-        return {"ok": False, "error": "仅支持 png / jpg / webp / gif / svg"}
-    try:
-        data = base64.b64decode(str(body.get("data") or ""), validate=True)
-    except Exception:  # noqa: BLE001
-        return {"ok": False, "error": "图片数据无效"}
-    if not data or len(data) > ICON_MAX:
-        return {"ok": False, "error": f"图片不能超过 {ICON_MAX // 1024} KB"}
-    if ext == "svg":
-        head = data[:2048].lstrip().lower()
-        if b"<svg" not in data[:4096].lower() and not head.startswith(b"<?xml"):
-            return {"ok": False, "error": "不是有效的 SVG"}
-    elif not data.startswith(ICON_EXTS[ext]) or (ext == "webp" and data[8:12] != b"WEBP"):
-        return {"ok": False, "error": "文件内容与扩展名不符"}
+    url = str(body.get("url") or "").strip()
+    if url:
+        data, err = _download_icon(url)
+        if err:
+            return {"ok": False, "error": err}
+        ext = _sniff_icon_ext(data)
+        if not data or not ext:
+            return {"ok": False, "error": "该地址不是 png / jpg / webp / gif / svg 图片"}
+    else:
+        ext = str(body.get("ext") or "").lower().lstrip(".")
+        ext = "jpg" if ext == "jpeg" else ext
+        if ext not in ICON_TYPES:
+            return {"ok": False, "error": "仅支持 png / jpg / webp / gif / svg"}
+        try:
+            data = base64.b64decode(str(body.get("data") or ""), validate=True)
+        except Exception:  # noqa: BLE001
+            return {"ok": False, "error": "图片数据无效"}
+        if not data or len(data) > ICON_MAX:
+            return {"ok": False, "error": f"图片不能超过 {ICON_MAX // 1024} KB"}
+        if ext == "svg":
+            head = data[:2048].lstrip().lower()
+            if b"<svg" not in data[:4096].lower() and not head.startswith(b"<?xml"):
+                return {"ok": False, "error": "不是有效的 SVG"}
+        elif not data.startswith(ICON_EXTS[ext]) or (ext == "webp" and data[8:12] != b"WEBP"):
+            return {"ok": False, "error": "文件内容与扩展名不符"}
     d = _icon_dir()
     d.mkdir(parents=True, exist_ok=True)
     fn = f"{name}-{secrets.token_hex(4)}.{ext}"

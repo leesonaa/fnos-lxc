@@ -17,7 +17,7 @@
 
 ## 容器配置表单
 
-每个容器的「配置」按钮：主机名、开机自启、网桥/MAC、IPv4 / IPv6（DHCP 或静态）、CPU / 内存上限、
+每个容器的「配置」按钮：主机名、开机自启、网桥/MAC、IPv4 / IPv6（DHCP 或静态，IPv6 可禁用）、容器图标（内置或图片 URL）、CPU / 内存上限、
 TUN/TAP、FUSE、GPU 直通（/dev/dri）、Docker 嵌套、目录挂载；另有「高级：原始配置」直接编辑 config。
 表单项写入 config 末尾的受管区块（`# >>> fnos-lxc managed >>>`），每次保存前备份为 `config.fnos-bak`。
 IPv4 设为静态时，会同时关闭容器内 **eth0** 的 DHCP（ifupdown / systemd-networkd / netplan / NetworkManager），避免出现额外的自动分配地址；保存后需重启容器生效。每处改动前会插入一行 `# fnos-lxc:` 标记并记录原值，改回 DHCP 时只撤销带标记的改动；不碰 eth0 以外的网卡，也不会覆盖你在容器里做的其它修改。
