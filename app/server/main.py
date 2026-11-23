@@ -593,12 +593,14 @@ def list_containers() -> list:
         try:
             cs = lxcconf.parse_settings(p.read_text(errors="ignore")) if p else {}
             c["webui"] = cs.get("webui", "")
+            c["icon"] = cs.get("icon", "")
             mem_mb = cs.get("memory_mb", 0)
             cpu_cores = cs.get("cpu_cores", 0)
             if p:  # 运行中的容器 lxc-ls 返回的是启动时加载的配置，以磁盘上的 config 为准
                 c["autostart"] = bool(cs.get("autostart"))
         except OSError:
             c["webui"] = ""
+            c["icon"] = ""
         if running and not c["pid"]:
             r = run(["lxc-info", "-n", c["name"], "-pH"], timeout=10)
             c["pid"] = int(r["stdout"]) if r["ok"] and r["stdout"].isdigit() else 0
@@ -659,6 +661,8 @@ def container_action(name: str, action: str, confirm: bool = False) -> dict:
     r = run(mapping[action], timeout=180)
     err = r["stderr"].splitlines()[-1] if r["stderr"] else ""
     ok = r["ok"]
+    if ok and action == "destroy":
+        cleanup_icons(name, "")
     oplog.log("container." + action, ok=ok, name=name, detail="" if ok else (err or r.get("stderr") or r.get("stdout") or f"exit={r.get('code')}"))
     return {"ok": ok, "error": "" if ok else err, "detail": r}
 
@@ -1534,6 +1538,70 @@ def resize_container(name: str, body: dict) -> dict:
     return {"ok": True, "job": job["id"]}
 
 
+# ----- 自定义图标 -----
+
+ICON_EXTS = {"png": b"\x89PNG\r\n\x1a\n", "jpg": b"\xff\xd8\xff", "webp": b"RIFF", "gif": b"GIF8"}
+ICON_TYPES = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp", "gif": "image/gif", "svg": "image/svg+xml"}
+ICON_MAX = 300 * 1024
+
+
+def _icon_dir() -> Path:
+    return DATA_DIR / "icons"
+
+
+def save_container_icon(name: str, body: dict) -> dict:
+    name = clean_name(name)
+    if not name or not ct_config_path(name):
+        return {"ok": False, "error": "容器不存在"}
+    ext = str(body.get("ext") or "").lower().lstrip(".")
+    ext = "jpg" if ext == "jpeg" else ext
+    if ext not in ICON_TYPES:
+        return {"ok": False, "error": "仅支持 png / jpg / webp / gif / svg"}
+    try:
+        data = base64.b64decode(str(body.get("data") or ""), validate=True)
+    except Exception:  # noqa: BLE001
+        return {"ok": False, "error": "图片数据无效"}
+    if not data or len(data) > ICON_MAX:
+        return {"ok": False, "error": f"图片不能超过 {ICON_MAX // 1024} KB"}
+    if ext == "svg":
+        head = data[:2048].lstrip().lower()
+        if b"<svg" not in data[:4096].lower() and not head.startswith(b"<?xml"):
+            return {"ok": False, "error": "不是有效的 SVG"}
+    elif not data.startswith(ICON_EXTS[ext]) or (ext == "webp" and data[8:12] != b"WEBP"):
+        return {"ok": False, "error": "文件内容与扩展名不符"}
+    d = _icon_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    fn = f"{name}-{secrets.token_hex(4)}.{ext}"
+    (d / fn).write_bytes(data)
+    return {"ok": True, "icon": f"custom:{fn}"}
+
+
+def _icon_files_of(name: str) -> list:
+    d = _icon_dir()
+    if not d.is_dir():
+        return []
+    pat = re.compile(rf"^{re.escape(name)}-[0-9a-f]{{8}}\.(png|jpg|webp|gif|svg)$")
+    return [f for f in d.iterdir() if pat.match(f.name)]
+
+
+def cleanup_icons(name: str, keep: str = "") -> None:
+    """删除该容器不再使用的自定义图标文件（keep 为当前生效的 custom:<文件名>）。"""
+    keep_fn = keep[len("custom:"):] if keep.startswith("custom:") else ""
+    for f in _icon_files_of(name):
+        if f.name != keep_fn:
+            f.unlink(missing_ok=True)
+
+
+def read_icon(fn: str):
+    """返回 (数据, content-type)，文件名不合法或不存在返回 None。"""
+    if not re.match(r"^[A-Za-z0-9._-]{1,120}\.(png|jpg|webp|gif|svg)$", fn) or ".." in fn:
+        return None
+    f = _icon_dir() / fn
+    if not f.is_file():
+        return None
+    return f.read_bytes(), ICON_TYPES[fn.rsplit(".", 1)[1]]
+
+
 # ----- 容器配置（表单 / 原始） -----
 
 def _prepare_host_devices(s: dict) -> None:
@@ -1590,6 +1658,7 @@ def save_container_settings(name: str, raw: dict, check_mounts: bool = True) -> 
         (p.parent / "config.fnos-bak").write_text(text)
         _atomic_write(p, new)
     _sync_guest_net(p, new)
+    cleanup_icons(name, s.get("icon", ""))
     _prepare_host_devices(s)
     out = {"ok": True, "needs_restart": container_state(name) in ("RUNNING", "FROZEN")}
     if s.get("docker"):
@@ -1937,7 +2006,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _read_json(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0:
+        if length <= 0 or length > 4 * 1024 * 1024:  # 最大的合法请求是图标上传（base64 后不到 1MB）
             return {}
         raw = self.rfile.read(length)
         try:
@@ -2120,6 +2189,23 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, storage_info())
             return
 
+        m = re.match(r"^/api/icon/([^/]+)$", path)
+        if m:
+            got = read_icon(m.group(1))
+            if not got:
+                self.send_error(404)
+                return
+            data, ctype = got
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox")
+            self.send_header("Cache-Control", "private, max-age=300")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
         if path == "/api/custom-cache":
             self._json(200, cache_list())
             return
@@ -2157,6 +2243,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/custom-cache/clear":
             self._json(200, cache_clear(body))
+            return
+
+        m = re.match(r"^/api/container/([^/]+)/icon$", path)
+        if m:
+            self._json(200, save_container_icon(m.group(1), body))
             return
 
         m = re.match(r"^/api/container/([^/]+)/resize$", path)

@@ -226,13 +226,16 @@
     .term-box .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
     .term-box .xterm-viewport::-webkit-scrollbar-thumb { background: #3a4150; border-radius: 4px; }
     .term-box .xterm { padding: 6px 12px 6px 6px; }
+    #modal-add .modal { max-height: 92vh; overflow-y: auto; }
+    .iconbtn { width: 32px; height: 32px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 16px; line-height: 1; }
     .term-dock { position: fixed; left: 12px; bottom: 12px; z-index: 60; display: flex; gap: 6px; flex-wrap: wrap; max-width: calc(100vw - 24px); }
     .term-dock .chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 999px; background: #0a0b0d; color: #d4d8de; border: 1px solid #3a4150; font-size: 13px; cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,.35); }
     .term-dock .chip:hover { border-color: #3dd68c; }
     .term-dock .chip.dead { opacity: .6; }
     .term-dock .chip .dot { width: 8px; height: 8px; border-radius: 50%; background: #3dd68c; }
     .term-dock .chip .dot.off { background: #777; }
-    .term-dock .chip .dot.new { background: #f5a524; }
+    .term-dock .chip .dot.new { background: #f5a524; animation: dotpulse 1s ease-in-out infinite; }
+    @keyframes dotpulse { 50% { opacity: .4; } }
     .term-dock .chip .x { padding: 0 4px; border-radius: 4px; color: #9aa3b2; }
     .term-dock .chip .x:hover { background: #3a4150; color: #fff; }
     .stat { white-space: nowrap; font-variant-numeric: tabular-nums; }
@@ -539,6 +542,16 @@
           <legend>基本</legend>
           <div class="grid2">
             <div class="field" style="grid-column:1/-1"><label>WebUI 地址（点击容器图标打开，可用 [IP] 代表容器 IPv4）</label><input type="text" id="c-webui" placeholder="http://[IP]:8080" /></div>
+            <div class="field" style="grid-column:1/-1">
+              <label>图标（默认按发行版自动识别，可换成内置图标或上传自己的图片）</label>
+              <div class="row" style="gap:8px">
+                <span class="icon" style="flex:none"><img id="c-icon-prev" src="icons/linux.svg" alt=""></span>
+                <select id="c-icon-sel" style="flex:1;min-width:0"></select>
+                <button type="button" id="c-icon-up">上传图片…</button>
+                <input type="file" id="c-icon-file" class="hidden" accept="image/png,image/jpeg,image/webp,image/gif,image/svg+xml">
+              </div>
+              <p class="hint" style="margin:4px 0 0">png / jpg / webp / gif / svg，不超过 300 KB；保存配置后生效。</p>
+            </div>
             <div class="field"><label>主机名</label><input type="text" id="c-hostname" placeholder="留空则与容器名相同" /></div>
             <div class="field"><label>自启延迟（秒）</label><input type="number" id="c-delay" min="0" max="600" /></div>
           </div>
@@ -642,8 +655,8 @@
         <span class="hint" id="term-status" style="margin:0"></span>
         <div class="spacer"></div>
         <button id="term-reconnect" class="hidden">重新连接</button>
-        <button id="term-min" title="最小化：终端保持连接，可在底部切换回来，或另开新终端">最小化</button>
-        <button id="term-close">关闭</button>
+        <button id="term-min" class="iconbtn" title="最小化（终端保持连接，可在左下角恢复，或另开新终端）" aria-label="最小化">&#8211;</button>
+        <button id="term-close" class="iconbtn" title="关闭此终端" aria-label="关闭">&#10005;</button>
       </div>
       <div id="term-boxes" style="flex:1;min-height:0;position:relative"></div>
     </div>
@@ -727,9 +740,13 @@
       archlinux: "archlinux", arch: "archlinux", opensuse: "opensuse", "opensuse-leap": "opensuse", rockylinux: "rockylinux", rocky: "rockylinux",
       almalinux: "almalinux", kali: "kalilinux", mint: "linuxmint", linuxmint: "linuxmint", gentoo: "gentoo", voidlinux: "voidlinux",
       void: "voidlinux", nixos: "nixos", rhel: "redhat", openwrt: "openwrt" };
-    function distroIcon(d, name, webui) {
-      const slug = ICONS[(d || "").toLowerCase()] || "linux";
-      return `<span class="icon webui-btn" data-webui="${esc(name || "")}" title="${webui ? "打开 WebUI：" + esc(webui) : "点击设置 WebUI 地址"}"><img src="icons/${slug}.svg" alt="${esc(d)}" onerror="this.onerror=null;this.src='icons/linux.svg'"></span>`;
+    function iconSrc(d, icon) {
+      if (icon && icon.startsWith("custom:")) return "api/icon/" + encodeURIComponent(icon.slice(7));
+      if (icon && icon.startsWith("builtin:")) return "icons/" + encodeURIComponent(icon.slice(8)) + ".svg";
+      return "icons/" + (ICONS[(d || "").toLowerCase()] || "linux") + ".svg";
+    }
+    function distroIcon(d, name, webui, icon) {
+      return `<span class="icon webui-btn" data-webui="${esc(name || "")}" title="${webui ? "打开 WebUI：" + esc(webui) : "点击设置 WebUI 地址"}"><img src="${esc(iconSrc(d, icon))}" alt="${esc(d)}" onerror="this.onerror=null;this.src='icons/linux.svg'"></span>`;
     }
 
     function ipCell(list, cls) {
@@ -834,7 +851,7 @@
     function rowHtml(c) {
       const { n, sw, btns, title } = ctParts(c);
       return `<tr data-name="${n}">
-          <td>${distroIcon(c.distro, c.name, c.webui)}</td>
+          <td>${distroIcon(c.distro, c.name, c.webui, c.icon)}</td>
           <td>${title}</td>
           <td class="c">${stateBadge(c.state)}</td>
           <td class="stat c" data-k="cpu">${statCpu(c)}</td>
@@ -885,7 +902,7 @@
       const { n, sw, btns, title } = ctParts(c);
       return `<div class="ct-card" data-name="${n}">
           <div class="ct-head">
-            ${distroIcon(c.distro, c.name, c.webui)}
+            ${distroIcon(c.distro, c.name, c.webui, c.icon)}
             <div class="ct-title">${title}</div>
             ${stateBadge(c.state)}
             ${sw}
@@ -1276,8 +1293,13 @@
         if (j.status === "error") {
           addJob = null; addBusy(false);
           $("#add-log").classList.remove("hidden");
-          $("#add-stage").textContent = "创建失败";
-          toast(j.error || "创建失败");
+          let msg = j.error || "创建失败";
+          if (/Failed to download/i.test(msg + (j.log || []).join(" ")) && /nixos/i.test($("#add-distro").value) && addMode === "std")
+            msg += "（官方镜像源没有 NixOS 的 LXC rootfs.tar.xz，请改用「自定义 rootfs」，填 rootfs.squashfs 的地址）";
+          $("#add-stage").textContent = "创建失败：" + msg;
+          $("#add-log").scrollTop = $("#add-log").scrollHeight;
+          $("#add-prog").scrollIntoView({ block: "nearest" });
+          toast(msg);
           return;
         }
         await new Promise((r) => setTimeout(r, 1000));
@@ -1308,6 +1330,7 @@
       $("#add-log").classList.add("hidden");
       $("#add-name").value = "";
       storageTouched = false;
+      recoAuto = false;
       $("#add-reco").textContent = "";
       $("#add-storage").querySelector('option[value="dir"]').disabled = false;
       loadCache();
@@ -1331,26 +1354,43 @@
     const STRICT_PERM = { nixos: "NixOS 的 Nix 构建要求输出目录权限严格，fnOS 的 Btrfs（trimacl）不遵循 umask，会被拒绝" };
     let storageTouched = false;
     function recoText() {
-      const parts = [$("#add-name").value, $("#add-cdistro").value, $("#add-curl").value, $("#add-cpath").value];
+      // 只看当前页签里实际可见的字段（官方镜像页签不能受自定义页签里残留内容的影响）
+      const parts = [$("#add-name").value];
       if (addMode === "std") parts.push($("#add-distro").value);
+      else parts.push($("#add-cdistro").value, $("#add-curl").value, $("#add-cpath").value);
       const t = parts.join(" ").toLowerCase();
       for (const k of Object.keys(STRICT_PERM)) if (t.includes(k)) return k;
       return "";
     }
+    let recoAuto = false;  // 存储格式是否由推荐逻辑自动切到 loop 的
     async function updateReco() {
       const k = recoText();
       const el = $("#add-reco");
       $("#add-storage").querySelector('option[value="dir"]').disabled = !!k;  // NixOS 不允许目录存储
-      if (!k) { el.textContent = ""; return; }
-      el.textContent = `${k === "nixos" ? "NixOS 只能使用" : "推荐"} ext4 镜像：${STRICT_PERM[k]}。`;
-      if (k === "nixos" || (!storageTouched && $("#add-storage").value !== "loop")) {
-        if ($("#add-storage").value === "loop") return;
+      if (!k) {
+        el.textContent = "";
+        if (recoAuto && !storageTouched) {  // 不再是 NixOS：把自动切换的 loop 还原成目录
+          recoAuto = false;
+          $("#add-storage").value = "dir";
+          await $("#add-storage").onchange();
+        }
+        return;
+      }
+      el.innerHTML = esc(`NixOS 只能使用 ext4 镜像：${STRICT_PERM[k]}。`) +
+        (addMode === "std" ? ` 另外官方镜像源通常没有 NixOS 的 LXC rootfs.tar.xz（只发布 rootfs.squashfs），下载可能失败，建议<a href="#" id="reco-custom">改用「自定义 rootfs」</a>。` : "");
+      if ($("#add-storage").value !== "loop") {
+        recoAuto = true;
         $("#add-storage").value = "loop";
         await $("#add-storage").onchange();
         const free = Math.floor(($("#add-size").max || 20));
         if (Number($("#add-size").value) < 12) $("#add-size").value = String(Math.min(20, Math.max(1, free)));
       }
     }
+    $("#add-reco").addEventListener("click", (e) => {
+      if (e.target.id !== "reco-custom") return;
+      e.preventDefault();
+      document.querySelector('#add-mode button[data-m="custom"]').click();
+    });
     ["add-name", "add-cdistro", "add-curl", "add-cpath"].forEach((id) => $("#" + id).addEventListener("input", updateReco));
     $("#add-distro").addEventListener("change", updateReco);
     $("#add-storage").addEventListener("change", (e) => { if (e.isTrusted) storageTouched = true; });
@@ -1515,6 +1555,9 @@
       cv("cfg-save-restart").classList.toggle("hidden", !running);
       cv("c-hostname").value = s.hostname || "";
       cv("c-webui").value = s.webui || "";
+      cfgIcon = s.icon || "";
+      cfgDistro = r.distro || "";
+      iconRender();
       cv("c-delay").value = s.start_delay ?? 5;
       cv("c-autostart").checked = !!s.autostart;
       fillBridges(cv("c-bridge"), r.bridges, s.bridge || "");
@@ -1532,10 +1575,42 @@
       $("#modal-cfg details").open = false;
       cv("modal-cfg").classList.remove("hidden");
     }
+    // ----- 自定义图标 -----
+    const BUILTIN_ICONS = [["debian", "Debian"], ["ubuntu", "Ubuntu"], ["alpinelinux", "Alpine"], ["fedora", "Fedora"], ["centos", "CentOS"],
+      ["archlinux", "Arch Linux"], ["opensuse", "openSUSE"], ["rockylinux", "Rocky Linux"], ["almalinux", "AlmaLinux"], ["kalilinux", "Kali"],
+      ["linuxmint", "Linux Mint"], ["gentoo", "Gentoo"], ["voidlinux", "Void"], ["nixos", "NixOS"], ["redhat", "Red Hat"], ["openwrt", "OpenWrt"], ["linux", "通用 Linux"]];
+    let cfgIcon = "", cfgDistro = "";
+    function iconRender() {
+      const sel = cv("c-icon-sel");
+      sel.innerHTML = `<option value="">自动识别</option>` +
+        BUILTIN_ICONS.map(([k, t]) => `<option value="builtin:${k}">${t}</option>`).join("") +
+        (cfgIcon.startsWith("custom:") ? `<option value="${esc(cfgIcon)}">自定义图片（当前）</option>` : "");
+      sel.value = cfgIcon;
+      cv("c-icon-prev").src = iconSrc(cfgDistro, cfgIcon);
+    }
+    cv("c-icon-sel").onchange = () => { cfgIcon = cv("c-icon-sel").value; iconRender(); };
+    cv("c-icon-up").onclick = () => cv("c-icon-file").click();
+    cv("c-icon-file").onchange = async () => {
+      const f = cv("c-icon-file").files[0];
+      cv("c-icon-file").value = "";
+      if (!f) return;
+      if (f.size > 300 * 1024) { toast("图片不能超过 300 KB"); return; }
+      const ext = (f.name.split(".").pop() || "").toLowerCase();
+      const buf = new Uint8Array(await f.arrayBuffer());
+      let bin = "";
+      for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+      const r = await api(`/api/container/${encodeURIComponent(cfgName)}/icon`, { method: "POST", body: { ext, data: btoa(bin) } });
+      if (!r.ok) { toast(r.error || "上传失败"); return; }
+      cfgIcon = r.icon;
+      iconRender();
+      toast("图片已上传，保存配置后生效");
+    };
+
     function collectForm() {
       return {
         hostname: cv("c-hostname").value.trim(),
         webui: cv("c-webui").value.trim(),
+        icon: cfgIcon,
         start_delay: +cv("c-delay").value || 0,
         autostart: cv("c-autostart").checked,
         bridge: cv("c-bridge").value,
@@ -1601,7 +1676,7 @@
       const modalHidden = cv("modal-term").classList.contains("hidden");
       dock.classList.toggle("hidden", termSessions.length === 0 || !modalHidden);
       dock.innerHTML = termSessions.map((s) =>
-        `<div class="chip ${s.dead ? "dead" : ""}" data-id="${s.id}" title="点击恢复该终端"><span class="dot ${s.dead ? "off" : s.unread ? "new" : ""}"></span>终端 · ${esc(termLabel(s))}<span class="x" data-x="${s.id}" title="关闭该终端">✕</span></div>`).join("");
+        `<div class="chip ${s.dead ? "dead" : ""}" data-id="${s.id}" title="点击恢复该终端"><span class="dot ${s.dead ? "off" : s.busy ? "new" : ""}"></span>终端 · ${esc(termLabel(s))}<span class="x" data-x="${s.id}" title="关闭该终端">✕</span></div>`).join("");
     }
     cv("term-dock").addEventListener("click", (e) => {
       const x = e.target.closest("[data-x]");
@@ -1626,15 +1701,15 @@
     }
     function termDestroy(s) {
       s.closed = true;
+      clearTimeout(s.quietTimer);
       if (s.ws) { const w = s.ws; s.ws = null; try { w.close(); } catch (e) {} }
       if (s.ro) { s.ro.disconnect(); s.ro = null; }
       try { s.term.dispose(); } catch (e) {}
       s.el.remove();
       termSessions.splice(termSessions.indexOf(s), 1);
-      if (termActive === s) {
+      if (termActive === s) {  // 关掉的是当前终端：收起窗口，其余终端留在左下角，不会被自动恢复
         termActive = null;
-        if (termSessions.length && !cv("modal-term").classList.contains("hidden")) termActivate(termSessions[termSessions.length - 1]);
-        else cv("modal-term").classList.add("hidden");
+        cv("modal-term").classList.add("hidden");
       }
       termRenderDock();
     }
@@ -1657,7 +1732,12 @@
         if (!(e.data instanceof ArrayBuffer)) return;
         s.term.write(new Uint8Array(e.data));
         if (s !== termActive || cv("modal-term").classList.contains("hidden")) {
-          if (!s.unread) { s.unread = true; termRenderDock(); }
+          // 有输出 → 黄色（运行中）；2.5 秒没有新输出 → 恢复绿色（空闲/已完成）
+          const wasBusy = s.busy;
+          s.busy = true;
+          clearTimeout(s.quietTimer);
+          s.quietTimer = setTimeout(() => { s.busy = false; termRenderDock(); }, 2500);
+          if (!wasBusy) termRenderDock();
         }
       };
       ws.onclose = () => {

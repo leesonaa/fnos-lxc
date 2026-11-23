@@ -37,6 +37,9 @@ _DEV_FUSE = "c 10:229 rwm"
 _DEV_DRI = "c 226:* rwm"
 
 _WEBUI_RE = re.compile(r"^#\s*fnos\.webui\s*=\s*(.*)$", re.M)
+_ICON_RE = re.compile(r"^#\s*fnos\.icon\s*=\s*(\S+)\s*$", re.M)
+# 图标取值：空=按发行版自动识别；builtin:<内置图标名>；custom:<上传文件名>
+_ICON_VAL = re.compile(r"^(?:builtin:[a-z0-9_-]{1,40}|custom:[A-Za-z0-9._-]{1,100}\.(?:png|jpg|webp|gif|svg))$")
 _OPT_RE = re.compile(r"^[A-Za-z0-9_=.:-]+$")
 _PLAIN_OPTS = {"bind", "ro", "rw", "create=dir", "create=file"}
 MAX_CPU_CORES = 1024
@@ -50,6 +53,7 @@ DEFAULTS = {
     "start_delay": 5,
     "hostname": "",
     "webui": "",  # 点击图标打开的地址，支持 [IP] 占位符
+    "icon": "",  # 自定义图标，空则按发行版自动识别
     "bridge": "",
     "hwaddr": "",
     "ipv4_mode": "dhcp",  # dhcp | static
@@ -112,6 +116,9 @@ def parse_settings(text: str) -> dict:
     m = _WEBUI_RE.search(text)
     if m:
         s["webui"] = m.group(1).strip()
+    m = _ICON_RE.search(text)
+    if m and _ICON_VAL.match(m.group(1)) and ".." not in m.group(1):
+        s["icon"] = m.group(1)
     for _, k, v in _kv_lines(text):
         if k == "lxc.start.auto":
             s["autostart"] = v == "1"
@@ -215,6 +222,11 @@ def validate(raw: dict) -> tuple[dict | None, str]:
     if webui and (not re.match(r"^https?://[^\s]+$", webui) or len(webui) > 500):
         return None, "WebUI 地址需以 http:// 或 https:// 开头，且不含空格"
     s["webui"] = webui
+
+    icon = str(raw.get("icon") or "").strip()
+    if icon and (not _ICON_VAL.match(icon) or ".." in icon):
+        return None, "图标取值无效"
+    s["icon"] = icon
 
     br = str(raw.get("bridge") or "").strip()
     if not br or not _BRIDGE_RE.match(br):
@@ -341,6 +353,8 @@ def build_block(s: dict, bind_is_file=lambda p: False) -> list[str]:
         L.append(f"lxc.uts.name = {s['hostname']}")
     if s["webui"]:
         L.append(f"# fnos.webui = {s['webui']}")
+    if s.get("icon"):
+        L.append(f"# fnos.icon = {s['icon']}")
     L += [
         "lxc.net.0.type = veth",
         "lxc.net.0.flags = up",

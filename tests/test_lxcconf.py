@@ -80,3 +80,22 @@ class RoundTripTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IconSettingTests(unittest.TestCase):
+    def _roundtrip(self, icon):
+        s = lxcconf.parse_settings("lxc.rootfs.path = dir:/x\n")
+        raw = dict(s, icon=icon, bridge="br0")
+        v, err = lxcconf.validate(raw)
+        return v, err
+
+    def test_valid_and_roundtrip(self):
+        for ic in ("", "builtin:debian", "custom:web-1a2b3c4d.png", "custom:a.b-c_d.svg"):
+            v, err = self._roundtrip(ic)
+            self.assertEqual(err, "", ic)
+            text = lxcconf.apply_settings("lxc.rootfs.path = dir:/x\n", v)
+            self.assertEqual(lxcconf.parse_settings(text)["icon"], ic)
+
+    def test_invalid(self):
+        for ic in ("custom:../x.png", "custom:x.exe", "builtin:a b", "http://x/y.png", "custom:/etc/passwd.png"):
+            self.assertNotEqual(self._roundtrip(ic)[1], "", ic)

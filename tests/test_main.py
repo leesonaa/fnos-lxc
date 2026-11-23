@@ -136,3 +136,50 @@ class SnapshotTests(unittest.TestCase):
         self.assertFalse(main.snapshot_op("t1", {"op": "delete", "snap": "../x", "confirm": True})["ok"])
         self.assertFalse(main.snapshot_op("t1", {"op": "restore", "snap": "snap0", "confirm": True, "as_new": "a b"})["ok"])
         self.assertFalse(main.snapshot_op("nope", {"op": "create"})["ok"])
+
+
+class IconTests(unittest.TestCase):
+    def setUp(self):
+        import base64, tempfile
+        self.b64 = base64.b64encode
+        self.tmp = Path(tempfile.mkdtemp())
+        self._data_dir = main.DATA_DIR
+        main.DATA_DIR = self.tmp / "data"
+        base = self.tmp / "lxc"
+        (base / "web").mkdir(parents=True)
+        (base / "web" / "config").write_text("lxc.rootfs.path = dir:/x\n")
+        self._cfg = main.load_config()
+        main.save_config({**self._cfg, "lxcpath": str(base)})
+
+    def tearDown(self):
+        main.save_config(self._cfg)
+        main.DATA_DIR = self._data_dir
+
+    PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 32
+
+    def test_upload_and_read(self):
+        r = main.save_container_icon("web", {"ext": "png", "data": self.b64(self.PNG).decode()})
+        self.assertTrue(r["ok"], r)
+        fn = r["icon"][len("custom:"):]
+        data, ctype = main.read_icon(fn)
+        self.assertEqual((data, ctype), (self.PNG, "image/png"))
+        # 换新图后旧文件被清理
+        r2 = main.save_container_icon("web", {"ext": "png", "data": self.b64(self.PNG).decode()})
+        main.cleanup_icons("web", r2["icon"])
+        self.assertIsNone(main.read_icon(fn))
+        self.assertIsNotNone(main.read_icon(r2["icon"][7:]))
+        main.cleanup_icons("web", "")
+        self.assertIsNone(main.read_icon(r2["icon"][7:]))
+
+    def test_rejects(self):
+        ok = lambda **kw: main.save_container_icon("web", kw)["ok"]  # noqa: E731
+        self.assertFalse(ok(ext="png", data=self.b64(b"not a png").decode()))            # 魔数不符
+        self.assertFalse(ok(ext="exe", data=self.b64(self.PNG).decode()))                # 扩展名
+        self.assertFalse(ok(ext="png", data="!!!"))                                      # 非 base64
+        self.assertFalse(ok(ext="png", data=self.b64(self.PNG + b"0" * 400000).decode()))  # 太大
+        self.assertFalse(ok(ext="svg", data=self.b64(b"<html>").decode()))               # 不是 svg
+        self.assertTrue(ok(ext="svg", data=self.b64(b'<svg xmlns="http://www.w3.org/2000/svg"/>').decode()))
+        self.assertFalse(main.save_container_icon("nope", {"ext": "png", "data": self.b64(self.PNG).decode()})["ok"])
+        for bad in ("../x.png", "a/b.png", "x.exe", ".." + "/" * 2 + "etc.png"):
+            self.assertIsNone(main.read_icon(bad))
+        main.cleanup_icons("web", "")
