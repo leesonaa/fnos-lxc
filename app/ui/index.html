@@ -1741,9 +1741,10 @@
     }
     function islRender() {
       const html = islHtml();
+      // 相同内容直接返回，绝不能取消正在等待的换内容定时器（否则会停在 opacity 0 的黑胶囊上）
+      if (html === isl.last) return;
       clearTimeout(isl.swapT);
       if (!html) { isl.el.classList.remove("show"); isl.last = ""; isl.el.style.width = "0px"; isl.el.style.height = "0px"; return; }
-      if (html === isl.last) return;
       const wasShown = isl.el.classList.contains("show");
       isl.last = html;
       const swap = () => { isl.inn.innerHTML = html; islFit(); isl.inn.style.opacity = 1; };
