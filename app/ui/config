@@ -3,7 +3,7 @@
     "fnos-lxc.Application": {
       "title": "LXC 容器",
       "icon": "images/icon-{0}.png",
-      "type": "iframe",
+      "type": "url",
       "protocol": "",
       "gatewayPrefix": "/app/fnos-lxc",
       "gatewaySocket": "app.sock",
