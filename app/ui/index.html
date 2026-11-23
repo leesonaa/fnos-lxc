@@ -468,11 +468,8 @@
           <label>或填下载地址（填了则优先使用）</label>
           <input id="add-curl" placeholder="https://…/rootfs.tar.xz 或 rootfs.squashfs" style="width:100%" />
         </div>
-        <div class="grid2">
-          <div class="field"><label>发行版标识（用于图标，可留空自动识别）</label><input id="add-cdistro" placeholder="如 nixos / debian" /></div>
-          <div class="field"><label>架构</label><select id="add-carch"><option value="">与宿主机相同</option><option>amd64</option><option>arm64</option><option>armhf</option><option>i386</option></select></div>
-        </div>
-        <p class="hint">支持 .tar / .tar.gz / .tar.xz / .tar.zst / .tar.bz2 / .squashfs（如 NixOS 只发布 rootfs.squashfs）。必须是带 init 的完整系统 rootfs，Docker 镜像导出的包通常无法启动。压缩包需来自可信来源。</p>
+        <div class="field"><label>发行版标识（用于图标，可留空自动识别）</label><input id="add-cdistro" placeholder="如 nixos / debian" style="width:100%" /></div>
+        <p class="hint">支持 .tar / .tar.gz / .tar.xz / .tar.zst / .tar.bz2 / .squashfs（如 NixOS 只发布 rootfs.squashfs）。必须是带 init 的完整系统 rootfs，且架构与本机一致（LXC 不能运行异构架构）；Docker 镜像导出的包通常无法启动。压缩包需来自可信来源。</p>
       </div>
       <div id="add-std">
       <div class="field">
@@ -1283,7 +1280,7 @@
         ? await api("/api/container/create-custom", {
             method: "POST",
             body: { name, path: $("#add-cpath").value.trim(), url: $("#add-curl").value.trim(),
-                    distro: $("#add-cdistro").value.trim(), arch: $("#add-carch").value, autostart: $("#add-autostart").checked },
+                    distro: $("#add-cdistro").value.trim(), autostart: $("#add-autostart").checked },
           })
         : await api("/api/container/create", {
             method: "POST",

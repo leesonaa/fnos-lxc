@@ -1200,7 +1200,11 @@ def _custom_worker(job: dict, name: str, src: str, url: str, distro: str, releas
             err = _extract_squash(job, src, rootfs)
             if err:
                 return _custom_fail(job, name, "解包失败：" + err, cdir)
-        # 4) 检查 init、写配置
+        # 4) 架构检查（LXC 只能原生运行与宿主机相同架构的容器）
+        guest_arch = customfs.elf_arch(rootfs)
+        if guest_arch and not customfs.arch_compatible(arch, guest_arch):
+            return _custom_fail(job, name, f"rootfs 是 {guest_arch} 架构，而本机是 {customfs.ARCH_MAP.get(arch, arch)}：LXC 不能运行异构架构的容器", cdir)
+        # 5) 检查 init、写配置
         _job_set(job, stage="生成容器配置", progress=92)
         kind_init = customfs.init_kind(lambda rel: (rootfs / rel).exists() or (rootfs / rel).is_symlink())
         if not kind_init:
@@ -1266,7 +1270,7 @@ def create_custom_container(body: dict) -> dict:
         return {"ok": False, "error": err}
     distro = re.sub(r"[^a-z0-9]", "", str(body.get("distro") or "").lower())
     release = re.sub(r"[^A-Za-z0-9._-]", "", str(body.get("release") or ""))
-    arch = re.sub(r"[^a-z0-9_]", "", str(body.get("arch") or "")) or host_arch()
+    arch = host_arch()  # LXC 只能原生运行本机架构，忽略前端传入的架构
     job, err = _new_job(name)
     if not job:
         return {"ok": False, "error": err}

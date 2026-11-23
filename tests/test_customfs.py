@@ -48,6 +48,21 @@ class CustomFsTests(unittest.TestCase):
         self.assertIn("lxc.init.cmd = /init", t)
         self.assertIn("-d nixos -r 26.05", t)
 
+    def test_elf_arch(self):
+        import tempfile, os
+        d = Path(tempfile.mkdtemp())
+        (d / "bin").mkdir()
+        (d / "nix" / "store").mkdir(parents=True)
+        hdr = b"\x7fELF" + bytes([2, 1, 1, 0]) + bytes(8) + (2).to_bytes(2, "little") + (0xB7).to_bytes(2, "little")
+        (d / "nix/store/sh").write_bytes(hdr + bytes(40))
+        os.symlink("/nix/store/sh", d / "bin/sh")  # 绝对链接应按 rootfs 根解析
+        self.assertEqual(customfs.elf_arch(d), "aarch64")
+        self.assertTrue(customfs.arch_compatible("arm64", "aarch64"))
+        self.assertFalse(customfs.arch_compatible("amd64", "aarch64"))
+        self.assertTrue(customfs.arch_compatible("amd64", "i686"))
+        self.assertFalse(customfs.arch_compatible("arm64", "armv7l"))
+        self.assertEqual(customfs.elf_arch(Path(tempfile.mkdtemp())), "")
+
 
 if __name__ == "__main__":
     unittest.main()

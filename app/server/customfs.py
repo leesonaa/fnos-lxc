@@ -106,3 +106,48 @@ def build_config(name: str, rootfs: str, distro: str, release: str, arch: str,
     if init_cmd:
         lines.append(f"lxc.init.cmd = {init_cmd}")
     return "\n".join(lines) + "\n"
+
+
+# ELF e_machine -> 内核架构名
+_ELF_MACHINE = {0x3E: "x86_64", 0xB7: "aarch64", 0x28: "armv7l", 0x03: "i686", 0xF3: "riscv64"}
+_ELF_PROBES = ("bin/sh", "usr/bin/env", "bin/busybox", "sbin/init", "usr/bin/sh", "bin/ls", "usr/bin/ls")
+
+
+def resolve_in_root(root, rel: str, depth: int = 12):
+    """在 rootfs 内解析符号链接（绝对链接按 rootfs 根解释），返回真实文件 Path 或 None。"""
+    from pathlib import Path
+    root = Path(root)
+    cur = root / rel
+    for _ in range(depth):
+        if not cur.is_symlink():
+            return cur if cur.is_file() else None
+        t = cur.readlink() if hasattr(cur, "readlink") else Path(__import__("os").readlink(cur))
+        cur = root / str(t).lstrip("/") if str(t).startswith("/") else cur.parent / t
+    return None
+
+
+def elf_arch(root) -> str:
+    """读取 rootfs 内常见可执行文件的 ELF 头，返回 'x86_64' / 'aarch64' / ...；识别不了返回 ''。"""
+    for rel in _ELF_PROBES:
+        f = resolve_in_root(root, rel)
+        if not f:
+            continue
+        try:
+            with open(f, "rb") as fh:
+                h = fh.read(20)
+        except OSError:
+            continue
+        if h[:4] != b"\x7fELF" or len(h) < 20:
+            continue
+        little = h[5] == 1
+        em = int.from_bytes(h[18:20], "little" if little else "big")
+        return _ELF_MACHINE.get(em, "")
+    return ""
+
+
+def arch_compatible(host: str, guest: str) -> bool:
+    """宿主机能否原生运行该架构的 rootfs（不含 qemu 模拟）。"""
+    host, guest = ARCH_MAP.get(host, host), ARCH_MAP.get(guest, guest)
+    if not guest or host == guest:
+        return True
+    return host == "x86_64" and guest == "i686"  # x86_64 内核可运行 32 位 x86 用户态
