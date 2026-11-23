@@ -228,8 +228,14 @@
     .term-box .xterm { padding: 6px 12px 6px 6px; }
     #modal-add .modal { max-height: 92vh; overflow-y: auto; }
     .iconbtn { width: 32px; height: 32px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 16px; line-height: 1; }
-    .term-dock { position: fixed; left: 12px; bottom: 12px; z-index: 60; display: flex; gap: 6px; flex-wrap: wrap; max-width: calc(100vw - 24px); }
-    .term-dock .chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 999px; background: #0a0b0d; color: #d4d8de; border: 1px solid #3a4150; font-size: 13px; cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,.35); }
+    /* 最小化终端：贴左边竖排，平时只露出灯+名字，鼠标移上去再展开 */
+    .term-dock { position: fixed; left: 0; bottom: 12px; z-index: 60; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; max-height: calc(100vh - 24px); }
+    .term-dock .chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px 6px 8px; border-radius: 0 999px 999px 0; background: #0a0b0d; color: #d4d8de; border: 1px solid #3a4150; border-left: 0; font-size: 13px; cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,.35); white-space: nowrap; }
+    .term-dock .chip .nm { max-width: 5.5em; overflow: hidden; text-overflow: ellipsis; }
+    .term-dock .chip .pre, .term-dock .chip .x { display: none; }
+    .term-dock .chip:hover .nm { max-width: 18em; }
+    .term-dock .chip:hover .pre, .term-dock .chip:hover .x { display: inline; }
+    .term-dock .chip .dot { flex: none; }
     .term-dock .chip:hover { border-color: #3dd68c; }
     .term-dock .chip.dead { opacity: .6; }
     .term-dock .chip .dot { width: 8px; height: 8px; border-radius: 50%; background: #3dd68c; }
@@ -1676,9 +1682,9 @@
       const modalHidden = cv("modal-term").classList.contains("hidden");
       dock.classList.toggle("hidden", termSessions.length === 0 || !modalHidden);
       dock.innerHTML = termSessions.map((s) =>
-        `<div class="chip ${s.dead ? "dead" : ""}" data-id="${s.id}" title="点击恢复该终端"><span class="dot ${s.dead ? "off" : s.busy ? "new" : ""}"></span>终端 · ${esc(termLabel(s))}<span class="x" data-x="${s.id}" title="关闭该终端">✕</span></div>`).join("");
-      // 预留底部空间，避免悬浮的最小化标签盖住最后一行容器的按钮
-      document.body.style.paddingBottom = dock.classList.contains("hidden") ? "" : (dock.offsetHeight + 24) + "px";
+        `<div class="chip ${s.dead ? "dead" : ""}" data-id="${s.id}" title="点击恢复该终端"><span class="dot ${s.dead ? "off" : s.busy ? "new" : ""}"></span><span class="nm"><span class="pre">终端 · </span>${esc(termLabel(s))}</span><span class="x" data-x="${s.id}" title="关闭该终端">✕</span></div>`).join("");
+      // 预留左侧空间（收起态宽度），避免贴边的最小化标签盖住容器卡片
+      document.body.style.paddingLeft = dock.classList.contains("hidden") ? "" : (dock.offsetWidth + 8) + "px";
     }
     window.addEventListener("resize", () => { if (termSessions.length) termRenderDock(); });
     cv("term-dock").addEventListener("click", (e) => {
