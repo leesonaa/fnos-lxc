@@ -194,13 +194,14 @@ def start_install_job() -> dict:
                 return {"ok": True, "job": j["id"]}
         jid = f"{int(time.time() * 1000)}"
         job = {"id": jid, "kind": "install", "name": "lxc", "status": "running", "progress": 5,
-               "stage": "安装 LXC 软件包（可能需要几分钟）", "log": [], "elapsed": 0, "error": "", "result": None}
+               "stage": "安装 LXC 软件包（可能需要几分钟）", "log": [], "elapsed": 0, "error": "", "result": None,
+               "packages": [], "done": [], "current": ""}
         _JOBS[jid] = job
 
     def work():
         t0 = time.time()
         try:
-            res = step_install_packages()
+            res = step_install_packages(job)
         except Exception as e:  # noqa: BLE001
             res = {"ok": False, "step": "exception", "detail": {"stderr": str(e)}, "has_lxc": False}
         err = ""
@@ -215,32 +216,102 @@ def start_install_job() -> dict:
     return {"ok": True, "job": jid}
 
 
-def step_install_packages() -> dict:
+_APT_PKGS = ["lxc", "lxc-templates", "lxcfs", "bridge-utils", "debootstrap", "uidmap"]
+
+
+def parse_apt_line(line: str) -> dict:
+    """解析 apt 输出（含 APT::Status-Fd 的 dlstatus/pmstatus 行）。返回 kind: dl|pm|setup|unpack|log。"""
+    line = line.rstrip("\n")
+    if line.startswith(("dlstatus:", "pmstatus:")):
+        parts = line.split(":", 3)
+        try:
+            pct = float(parts[2])
+        except (IndexError, ValueError):
+            return {"kind": "log", "text": line}
+        return {"kind": "dl" if parts[0] == "dlstatus" else "pm", "pkg": parts[1], "pct": max(0.0, min(100.0, pct)),
+                "msg": parts[3] if len(parts) > 3 else ""}
+    m = re.match(r"^Setting up (\S+?)(?::\w+)? \(", line)
+    if m:
+        return {"kind": "setup", "pkg": m.group(1), "text": line}
+    m = re.match(r"^Unpacking (\S+?)(?::\w+)? \(", line)
+    if m:
+        return {"kind": "unpack", "pkg": m.group(1), "text": line}
+    return {"kind": "log", "text": line}
+
+
+def _apt_stream(cmd: list, job: dict, lo: float, hi: float, timeout: int, env: dict) -> dict:
+    """运行 apt 并把进度、当前软件包实时写进 job；下载占区间前 35%，安装占后 65%。"""
+    mid = lo + (hi - lo) * 0.35
+    t0 = time.time()
+    log: list = []
+    try:
+        p = subprocess.Popen(cmd, shell=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env, bufsize=1)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "code": -1, "stdout": "", "stderr": str(e)}
+    timer = threading.Timer(timeout, p.kill)
+    timer.start()
+    try:
+        for raw in p.stdout:
+            ev = parse_apt_line(raw)
+            kind = ev["kind"]
+            upd: dict = {"elapsed": int(time.time() - t0)}
+            if kind == "dl":
+                upd.update(progress=int(lo + (mid - lo) * ev["pct"] / 100), stage=f"下载软件包… {int(ev['pct'])}%")
+            elif kind == "pm":
+                upd.update(progress=int(mid + (hi - mid) * ev["pct"] / 100), current=ev["pkg"],
+                           stage=f"{ev['msg'] or '安装中'}")
+            elif kind == "unpack":
+                upd.update(current=ev["pkg"], stage=f"正在解包 {ev['pkg']}")
+            elif kind == "setup":
+                with _JOBS_LOCK:
+                    done = job.setdefault("done", [])
+                    if ev["pkg"] not in done:
+                        done.append(ev["pkg"])
+                upd.update(current=ev["pkg"], stage=f"正在配置 {ev['pkg']}")
+            if kind in ("unpack", "setup", "log") and ev.get("text", "").strip():
+                log.append(ev["text"])
+                upd["log"] = log[-200:]
+            _job_set(job, **upd)
+        p.wait()
+    finally:
+        timer.cancel()
+    text = "\n".join(log)
+    return {"ok": p.returncode == 0, "code": p.returncode, "stdout": text[-6000:], "stderr": ""}
+
+
+def _apt_plan(pkgs: list, env: dict) -> list:
+    """用模拟安装（-s）预先算出这次会装哪些包，供界面展示。"""
+    r = run(["apt-get", "-s", "install", "-y", *pkgs], timeout=60, env=env)
+    names = []
+    for ln in (r.get("stdout") or "").splitlines():
+        m = re.match(r"^Inst (\S+)", ln)
+        if m and m.group(1) not in names:
+            names.append(m.group(1))
+    return names
+
+
+def step_install_packages(job: dict | None = None) -> dict:
     """apt install native lxc stack."""
     if which("lxc-ls") and which("lxc-create"):
         return {"ok": True, "step": "packages", "detail": {"stdout": "already installed"}, "has_lxc": True}
-    pkgs = [
-        "lxc",
-        "lxc-templates",
-        "lxcfs",
-        "bridge-utils",
-        "debootstrap",
-        "uidmap",
-    ]
+    pkgs = _APT_PKGS
+    job = job if job is not None else {}
     # noninteractive; keep existing conf if we already wrote default.conf
     apt_env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
-    r = run(["apt-get", "update", "-qq"], timeout=180, env=apt_env)
+    _job_set(job, stage="更新软件源（apt-get update）", progress=5)
+    r = _apt_stream(["apt-get", "update", "-qq"], job, 5, 14, 180, apt_env)
     if not r["ok"]:
         return {"ok": False, "step": "apt-update", "detail": r, "has_lxc": False}
-    r2 = run(
+    plan = _apt_plan(pkgs, apt_env)
+    _job_set(job, packages=plan or list(pkgs), done=[], stage="准备安装…", progress=15)
+    r2 = _apt_stream(
         [
-            "apt-get", "install", "-y",
+            "apt-get", "install", "-y", "-o", "APT::Status-Fd=1",
             "-o", "Dpkg::Options::=--force-confdef",
             "-o", "Dpkg::Options::=--force-confold",
             *pkgs,
         ],
-        timeout=600,
-        env=apt_env,
+        job, 15, 98, 600, apt_env,
     )
     ok = which("lxc-ls") and which("lxc-create")
     if not r2["ok"] and not ok:

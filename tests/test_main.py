@@ -216,3 +216,17 @@ class IconTests(unittest.TestCase):
             srv.shutdown()
             main.cleanup_icons("web", "")
 
+
+class AptParseTests(unittest.TestCase):
+    def test_parse(self):
+        p = main.parse_apt_line
+        self.assertEqual(p("pmstatus:lxc:42.5:Installing lxc (amd64)\n")["pct"], 42.5)
+        self.assertEqual(p("pmstatus:lxc:42.5:Installing lxc (amd64)")["pkg"], "lxc")
+        self.assertEqual(p("dlstatus:1:10.0:Downloading file")["kind"], "dl")
+        self.assertEqual(p("Setting up lxc-templates (3.0.4-1) ...")["pkg"], "lxc-templates")
+        self.assertEqual(p("Setting up libc6:amd64 (2.36-9) ...")["pkg"], "libc6")
+        self.assertEqual(p("Unpacking lxcfs (5.0.3) ...")["kind"], "unpack")
+        self.assertEqual(p("random text")["kind"], "log")
+        self.assertEqual(p("pmstatus:x:abc:y")["kind"], "log")      # 坏数据不抛异常
+        self.assertEqual(p("pmstatus:x:150:y")["pct"], 100.0)        # 夹紧到 0-100
+
