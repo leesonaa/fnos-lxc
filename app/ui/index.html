@@ -184,6 +184,21 @@
       padding: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 12px; color: var(--log-text); max-height: 200px; overflow: auto; white-space: pre-wrap;
     }
+    .pkg-banner { display: flex; align-items: flex-start; gap: 12px; margin-top: 14px; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--border); }
+    .pkg-banner .ic { width: 22px; height: 22px; flex: none; margin-top: 1px; }
+    .pkg-banner .t { font-weight: 600; }
+    .pkg-banner .d { color: var(--muted); font-size: 13px; margin-top: 2px; }
+    .pkg-banner.run { border-color: var(--blue); background: rgba(89,194,255,.08); }
+    .pkg-banner.ok { border-color: var(--green); background: rgba(48,209,88,.10); }
+    .pkg-banner.err { border-color: var(--red); background: rgba(255,69,58,.10); }
+    .pkg-banner.ok .t { color: var(--green); } .pkg-banner.err .t { color: var(--red); }
+    .pkg-banner svg { width: 22px; height: 22px; fill: none; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
+    .pkg-banner.ok svg { stroke: var(--green); } .pkg-banner.err svg { stroke: var(--red); }
+    .spin { width: 20px; height: 20px; border: 2.5px solid rgba(128,128,128,.3); border-top-color: var(--blue); border-radius: 50%; animation: spin .8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .pkg-details { margin-top: 10px; }
+    .pkg-details summary { cursor: pointer; color: var(--muted); font-size: 13px; user-select: none; }
+    .pkg-details .log { margin-top: 8px; }
     .hidden { display: none !important; }
     .empty { text-align: center; color: var(--muted); padding: 40px 10px; }
     .modal-bg {
@@ -366,12 +381,16 @@
         <p style="color:var(--muted)">将通过 apt 安装 <code>lxc</code>、<code>lxc-templates</code>、<code>lxcfs</code> 等（需 root，可能需几分钟）。</p>
         <div class="row">
           <button class="primary" id="btn-install-pkgs">开始安装</button>
-          <span id="pkg-status" class="sub" style="margin:0"></span>
         </div>
-        <div class="log hidden" id="pkg-log" style="margin-top:12px"></div>
+        <div class="pkg-banner hidden" id="pkg-banner"></div>
+        <details class="pkg-details hidden" id="pkg-details">
+          <summary>查看详细日志</summary>
+          <div class="log" id="pkg-log"></div>
+        </details>
         <div class="row" style="margin-top:16px">
+          <span class="sub" id="pkg-next-hint" style="margin:0">安装完成后才能进入下一步</span>
           <div class="spacer"></div>
-          <button id="btn-to-2" disabled>下一步</button>
+          <button id="btn-to-2" disabled>下一步：选择存储路径 →</button>
         </div>
       </div>
 
@@ -753,6 +772,7 @@
         const el = $(`#step-${n}`);
         if (el) el.classList.toggle("hidden", n !== step);
       });
+      if (step === 1 && $("#pkg-banner").classList.contains("hidden")) pkgProbe();
       $$("#step-pills .step-pill").forEach((p) => {
         const s = +p.dataset.s;
         p.classList.toggle("active", s === step);
@@ -1207,32 +1227,67 @@
     $("#btn-refresh-bridge2").onclick = () => refreshBridges($("#set-bridge"), null, $("#btn-refresh-bridge2"));
 
     // ----- setup handlers -----
+    const PKG_OK = '<svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>';
+    const PKG_ERR = '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>';
+    function pkgBanner(kind, title, desc) {
+      const el = $("#pkg-banner");
+      el.className = `pkg-banner ${kind}`;
+      const ic = kind === "run" ? '<div class="spin"></div>' : `<div class="ic">${kind === "ok" ? PKG_OK : PKG_ERR}</div>`;
+      el.innerHTML = `${ic}<div><div class="t">${esc(title)}</div>${desc ? `<div class="d">${esc(desc)}</div>` : ""}</div>`;
+    }
+    function pkgReady(ready) {
+      const n = $("#btn-to-2");
+      n.disabled = !ready;
+      n.classList.toggle("primary", ready);
+      $("#pkg-next-hint").textContent = ready ? "已就绪，可以进入下一步" : "安装完成后才能进入下一步";
+    }
+    function pkgLogText(r) {  // 把后端结果还原成可读文本（真实换行），不再直接贴 JSON
+      const d = (r && r.detail) || {};
+      const parts = [];
+      if (r && r.step) parts.push(`步骤：${r.step}`);
+      for (const k of ["stdout", "stderr"]) {
+        const t = String(d[k] || "").replace(/\x1b\[[0-9;]*m/g, "").trim();
+        if (t) parts.push(`--- ${k} ---\n${t.split("\n").slice(-80).join("\n")}`);
+      }
+      if (r && r.error) parts.push(`错误：${r.error}`);
+      return parts.join("\n\n") || "（无输出）";
+    }
+    // 进入第 1 步时，若已安装 LXC 直接提示，可以跳过安装
+    async function pkgProbe() {
+      const info = await api("/api/setup/info");
+      if (info && info.has_lxc) {
+        pkgBanner("ok", "已检测到 LXC", "系统里已经装好了，无需再安装，可以直接点「下一步」。");
+        $("#btn-install-pkgs").textContent = "重新安装";
+        pkgReady(true);
+      }
+    }
     $("#btn-install-pkgs").onclick = async () => {
       const btn = $("#btn-install-pkgs");
-      btn.disabled = true;
-      $("#pkg-status").textContent = "安装中，请稍候…";
-      $("#pkg-log").classList.remove("hidden");
-      $("#pkg-log").textContent = "apt-get update && install lxc…\n";
+      btn.disabled = true; pkgReady(false);
+      $("#pkg-details").classList.add("hidden");
+      pkgBanner("run", "正在安装…", "通过 apt 下载并安装，通常需要 1–3 分钟，请不要关闭窗口。");
       let r = await api("/api/setup/install-packages", { method: "POST", body: {} });
       if (r.ok && r.job) {
         for (;;) {
           await new Promise((res) => setTimeout(res, 2000));
           const j = await api(`/api/job/${r.job}`);
           if (!j.ok && !j.status) { r = j; break; }
-          $("#pkg-status").textContent = `安装中，请稍候…（已用时 ${j.elapsed || 0}s）`;
+          pkgBanner("run", `正在安装…（已用时 ${j.elapsed || 0} 秒）`, "通过 apt 下载并安装，通常需要 1–3 分钟，请不要关闭窗口。");
           if (j.status === "done" || j.status === "error") { r = j.result || { ok: false, error: j.error }; break; }
         }
       }
-      $("#pkg-log").textContent += JSON.stringify(r, null, 2);
+      $("#pkg-log").textContent = pkgLogText(r);
+      $("#pkg-details").classList.remove("hidden");
       if (r.ok || r.has_lxc) {
-        $("#pkg-status").textContent = "安装成功";
-        $("#btn-to-2").disabled = false;
+        pkgBanner("ok", "安装完成", "原生 LXC 已就绪。点右下角「下一步」选择容器存储路径。");
+        btn.textContent = "重新安装";
+        pkgReady(true);
         toast("软件包已就绪");
       } else {
-        $("#pkg-status").textContent = "安装失败，请查看日志（或 SSH 手动 apt install lxc）";
-        // allow skip if already present
+        pkgBanner("err", "安装失败", "请展开下方「查看详细日志」查看原因；也可以通过 SSH 手动执行 apt install lxc 后再回来。");
+        $("#pkg-details").open = true;
         const info = await api("/api/setup/info");
-        if (info.has_lxc) $("#btn-to-2").disabled = false;
+        if (info.has_lxc) pkgReady(true);
       }
       btn.disabled = false;
     };
@@ -1859,10 +1914,6 @@
         } else {
           const info = await api("/api/setup/info");
           setupInfo = info;
-          if (info.has_lxc) {
-            $("#pkg-status").textContent = "系统已检测到 lxc，可跳过安装";
-            $("#btn-to-2").disabled = false;
-          }
           showSetup(1);
         }
       } catch (e) {
