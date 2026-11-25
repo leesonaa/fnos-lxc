@@ -327,3 +327,20 @@ class CancelTests(unittest.TestCase):
             self.assertFalse(c.exists())
             main._remove_container_dir(c)                    # 不存在也不报错
 
+
+class LxcPathTests(unittest.TestCase):
+    def test_volume_missing(self):
+        self.assertIn("/vol9", main.check_volume_user_dir("/vol9/1000/lxc"))
+
+    def test_user_dir_missing_message(self):
+        orig = os.path.isdir
+        os.path.isdir = lambda x, _o=orig: True if x == "/vol2" else (False if x == "/vol2/1000" else _o(x))
+        try:
+            err = main.check_volume_user_dir("/vol2/1000/lxc")
+        finally:
+            os.path.isdir = orig
+        self.assertIn("文件管理", err)
+
+    def test_other_paths_unaffected(self):
+        self.assertEqual(main.check_volume_user_dir("/mnt/data/lxc"), "")
+        self.assertEqual(main.check_volume_user_dir("/vol1/lxc"), "")     # 卷根下的目录不受影响

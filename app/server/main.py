@@ -322,6 +322,11 @@ def step_install_packages(job: dict | None = None) -> dict:
 _SYSTEM_DIRS = ("/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/proc", "/sys", "/dev", "/run", "/root")
 
 
+NO_SHARE_DIR_MSG = (
+    "{vol} 这个存储空间里还没有用户目录（{path} 的上一级不存在）。飞牛只有在存储空间里创建过共享文件夹后才会生成"
+    "该目录，直接创建会因权限报错。请先在飞牛「文件管理」里，在该存储空间下随便新建一个文件夹，再回来选择此路径。")
+
+
 def check_lxcpath(lxcpath: str) -> tuple[str, str, str]:
     """返回 (规范化路径, 错误, 警告)。"""
     p = str(lxcpath or "").strip().rstrip("/")
@@ -338,8 +343,20 @@ def check_lxcpath(lxcpath: str) -> tuple[str, str, str]:
     return p, "", warn
 
 
+def check_volume_user_dir(p: str) -> str:
+    """/volN/<uid>/… 形式的路径：用户目录必须已存在（飞牛在存储空间创建过共享文件夹后才会生成）。返回错误，空串表示通过。"""
+    m = re.match(r"^(/vol\d+)/(\d+)(/|$)", p)
+    if not m or os.path.isdir(f"{m.group(1)}/{m.group(2)}"):
+        return ""
+    if not os.path.isdir(m.group(1)):
+        return f"存储空间 {m.group(1)} 不存在，请确认路径"
+    return NO_SHARE_DIR_MSG.format(vol=m.group(1), path=p)
+
+
 def step_configure_storage(lxcpath: str) -> dict:
     lxcpath, err, warn0 = check_lxcpath(lxcpath)
+    if not err:
+        err = check_volume_user_dir(lxcpath)
     if err:
         return {"ok": False, "error": err}
     cache = Path(lxcpath) / "cache"
@@ -348,6 +365,9 @@ def step_configure_storage(lxcpath: str) -> dict:
         if not os.access(lxcpath, os.W_OK):
             return {"ok": False, "error": "所选路径不可写"}
     except OSError as e:
+        if re.match(r"^/vol\d+(/|$)", lxcpath):
+            return {"ok": False, "error": f"无法创建目录（{e.strerror}）。若这是一个还没有任何共享文件夹的存储空间，"
+                                          "请先在飞牛「文件管理」里在该存储空间下新建一个文件夹，再重试。"}
         return {"ok": False, "error": f"无法创建目录: {e}"}
     warn = warn0
     # /var/lib/lxc、/var/cache/lxc 仅在为空/不存在/已是软链时指向用户路径；
