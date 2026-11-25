@@ -1063,6 +1063,98 @@ def _job_set(job: dict, **kw) -> None:
         job.update(kw)
 
 
+_JOB_CLOSERS: dict = {}   # 任务 id -> 关闭当前下载连接的函数（让阻塞中的 read 立刻返回）
+
+
+def _kill_group(pid: int, grace: float = 3.0) -> None:
+    """先 SIGTERM 整个进程组（给脚本清理的机会），超时再 SIGKILL。"""
+    if not pid or pid <= 1:
+        return
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except OSError:
+        return
+
+    def _later():
+        time.sleep(grace)
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    threading.Thread(target=_later, daemon=True).start()
+
+
+def run_job(job: dict, cmd: list, timeout: int = 120) -> dict:
+    """可被 cancel_job 中断的 run()：子进程放进独立进程组，pid 记录在 job 里。"""
+    cancelled = {"ok": False, "code": -15, "stdout": "", "stderr": "已取消"}
+    if job.get("cancel"):
+        return cancelled
+    try:
+        p = subprocess.Popen(cmd, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             start_new_session=True)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "code": -1, "stdout": "", "stderr": str(e)}
+    _job_set(job, pid=p.pid)
+    if job.get("cancel"):
+        _kill_group(p.pid, 1.0)
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_group(p.pid, 0.5)
+        p.communicate()
+        return {"ok": False, "code": -1, "stdout": "", "stderr": "timeout"}
+    finally:
+        _job_set(job, pid=0)
+    if job.get("cancel"):
+        return cancelled
+    return {"ok": p.returncode == 0, "code": p.returncode, "stdout": (out or "").strip(), "stderr": (err or "").strip()}
+
+
+def cancel_job(jid: str) -> dict:
+    with _JOBS_LOCK:
+        job = _JOBS.get(jid)
+        if not job:
+            return {"ok": False, "error": "任务不存在"}
+        if job["status"] != "running":
+            return {"ok": False, "error": "任务已结束"}
+        job["cancel"] = True
+        job["stage_before_cancel"] = job.get("stage", "")
+        job["stage"] = "正在取消…"
+        pid, closer = job.get("pid") or 0, _JOB_CLOSERS.get(jid)
+    _kill_group(pid)
+    if closer:
+        try:
+            closer()
+        except Exception:  # noqa: BLE001
+            pass
+    oplog.log("container.create.cancel", ok=True, name=job["name"])
+    return {"ok": True}
+
+
+def _remove_container_dir(cdir: Path) -> None:
+    """彻底删除半成品容器目录：先卸载其中可能残留的挂载/loop 设备，再删；遇到不可变属性时清除后重试。"""
+    if not cdir.exists():
+        return
+    prefix = str(cdir)
+    try:
+        mounts = [ln.split()[1] for ln in Path("/proc/mounts").read_text().splitlines() if len(ln.split()) > 1]
+    except OSError:
+        mounts = []
+    for mp in sorted((m for m in mounts if m == prefix or m.startswith(prefix + "/")), key=len, reverse=True):
+        run(["umount", "-l", mp], timeout=30)
+    if which("losetup"):
+        for img in cdir.glob("*.img"):
+            r = run(["losetup", "-j", str(img)], timeout=10)
+            for ln in (r.get("stdout") or "").splitlines():
+                dev = ln.split(":", 1)[0]
+                if dev.startswith("/dev/loop"):
+                    run(["losetup", "-d", dev], timeout=10)
+    shutil.rmtree(cdir, ignore_errors=True)
+    if cdir.exists():
+        run(["chattr", "-R", "-i", str(cdir)], timeout=600)
+        shutil.rmtree(cdir, ignore_errors=True)
+
+
 def _find_rootfs_download(distro: str, release: str, arch: str):
     """下载模板的缓存目录层级固定：<cache>/download/<distro>/<release>/<arch>/default/<build>/rootfs.*
     只做定深度的 glob，绝不递归遍历容器目录。"""
@@ -1090,7 +1182,11 @@ def _create_worker(job: dict, name: str, distro: str, release: str, arch: str, a
     if mid != "official":
         argv += ["--server", image_server(mid).split("://", 1)[-1]]
     try:
-        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                start_new_session=True)
+        _job_set(job, pid=proc.pid)
+        if job.get("cancel"):
+            _kill_group(proc.pid, 1.0)
     except OSError as e:
         _job_set(job, status="error", error=f"无法执行 lxc-create：{e}")
         oplog.log("container.create", ok=False, name=name, detail=str(e), distro=distro, release=release)
@@ -1135,6 +1231,20 @@ def _create_worker(job: dict, name: str, distro: str, release: str, arch: str, a
                 except OSError:
                     pass
     th.join(timeout=3)
+    _job_set(job, pid=0)
+    if job.get("cancel"):
+        # 取消：清理半成品容器目录和还没下完的 rootfs 缓存文件
+        _remove_container_dir(lxc_base() / name)
+        if job.get("stage_before_cancel") == "下载根文件系统":
+            f = _find_rootfs_download(distro, release, arch)
+            if f:
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass
+        _job_set(job, status="cancelled", stage="已取消", error="已取消")
+        oplog.log("container.create", ok=False, name=name, detail="用户取消", distro=distro, release=release)
+        return
     if proc.returncode != 0:
         tail = job["log"][-1] if job["log"] else ""
         _job_set(job, status="error", error="lxc-create 失败：" + tail)
@@ -1199,7 +1309,11 @@ def get_job(jid: str) -> dict:
 
 def _custom_fail(job: dict, name: str, msg: str, cdir: Path | None = None) -> None:
     if cdir and cdir.exists():
-        shutil.rmtree(cdir, ignore_errors=True)
+        _remove_container_dir(cdir)
+    if job.get("cancel"):
+        _job_set(job, status="cancelled", stage="已取消", error="已取消")
+        oplog.log("container.create_custom", ok=False, name=name, detail="用户取消")
+        return
     _job_set(job, status="error", error=msg[:500])
     oplog.log("container.create_custom", ok=False, name=name, detail=msg[:500])
 
@@ -1207,7 +1321,7 @@ def _custom_fail(job: dict, name: str, msg: str, cdir: Path | None = None) -> No
 def _extract_squash(job: dict, src: str, dst: Path) -> str:
     """返回错误信息，空串表示成功。优先 unsquashfs，没有则 loop 挂载后拷贝。"""
     if which("unsquashfs"):
-        r = run(["unsquashfs", "-f", "-d", str(dst), src], timeout=7200)
+        r = run_job(job, ["unsquashfs", "-f", "-d", str(dst), src], timeout=7200)
         return "" if r["ok"] else _snap_err(r)
     import tempfile
     mnt = tempfile.mkdtemp(prefix="fnlxc-sq-")
@@ -1269,10 +1383,18 @@ def _fetch_cached(job: dict, url: str, t0: float) -> tuple[Path | None, str]:
         _job_set(job, stage="下载 rootfs", progress=5)
         try:
             with _http(url, "GET", timeout=60) as resp, open(part, "wb") as f:
+                def _close_conn(r=resp):
+                    try:
+                        r.fp.raw._sock.shutdown(2)   # 让阻塞中的 read 立刻返回
+                    except Exception:  # noqa: BLE001
+                        r.close()
+                _JOB_CLOSERS[job["id"]] = _close_conn
                 total = int(resp.headers.get("Content-Length") or 0)
                 _job_set(job, total=total)
                 got = 0
                 while True:
+                    if job.get("cancel"):
+                        raise OSError("已取消")
                     chunk = resp.read(1 << 20)
                     if not chunk:
                         break
@@ -1286,7 +1408,9 @@ def _fetch_cached(job: dict, url: str, t0: float) -> tuple[Path | None, str]:
             path.with_name(path.name + ".url").write_text(url + "\n")
         except Exception as e:  # noqa: BLE001
             part.unlink(missing_ok=True)
-            return None, f"下载失败：{e}"
+            return None, ("已取消" if job.get("cancel") else f"下载失败：{e}")
+        finally:
+            _JOB_CLOSERS.pop(job["id"], None)
     return path, ""
 
 
@@ -1340,6 +1464,8 @@ def _custom_worker(job: dict, name: str, src: str, url: str, distro: str, releas
             if err:
                 return _custom_fail(job, name, err)
             src = str(path)
+        if job.get("cancel"):
+            return _custom_fail(job, name, "已取消")
         kind = customfs.classify(src)
         size = os.path.getsize(src)
         free = _free_bytes(lxc_base())
@@ -1356,7 +1482,7 @@ def _custom_worker(job: dict, name: str, src: str, url: str, distro: str, releas
             _job_set(job, stage="检查压缩包", progress=52)
             if customfs.ext_of(src) == ".tar.zst" and not which("zstd"):
                 return _custom_fail(job, name, "缺少 zstd，请先 apt install zstd")
-            lst = run(["tar", "-tf", src], timeout=1800)
+            lst = run_job(job, ["tar", "-tf", src], timeout=1800)
             if not lst["ok"]:
                 return _custom_fail(job, name, "无法读取压缩包：" + _snap_err(lst))
             names = [x for x in lst["stdout"].splitlines() if x]
@@ -1373,9 +1499,9 @@ def _custom_worker(job: dict, name: str, src: str, url: str, distro: str, releas
                 argv = ["tar", "--numeric-owner", "--xattrs", "-xpf", src, "-C", str(rootfs)]
                 if strip:
                     argv.append(f"--strip-components={strip}")
-                r = run(argv, timeout=7200)
+                r = run_job(job, argv, timeout=7200)
                 if not r["ok"] and "xattr" in (r["stderr"] or "").lower():
-                    r = run([a for a in argv if a != "--xattrs"], timeout=7200)
+                    r = run_job(job, [a for a in argv if a != "--xattrs"], timeout=7200)
                 if not r["ok"]:
                     return "解包失败：" + _snap_err(r)
             else:
@@ -2556,6 +2682,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"ok": False, "error": "invalid name"})
                 return
             self._json(200, {"ok": True, "token": issue_term_token(name)})
+            return
+
+        if path == "/api/job/cancel":
+            self._json(200, cancel_job(str(body.get("id", ""))))
             return
 
         if path == "/api/container/term-close":

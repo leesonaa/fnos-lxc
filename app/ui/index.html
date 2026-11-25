@@ -1397,6 +1397,8 @@
     function addBusy(b) {
       $$("#add-custom input, #add-custom select, #add-mode button, #add-storage, #add-size").forEach((x) => (x.disabled = b));
       $("#add-ok").disabled = b;
+      const cb = $("#add-cancel");
+      cb.textContent = b ? "取消创建" : "取消"; cb.disabled = false;
       $("#add-name").disabled = $("#add-mirror").disabled = $("#add-distro").disabled = $("#add-release").disabled = b;
     }
     async function pollJob(id) {
@@ -1416,6 +1418,13 @@
           $("#modal-add").classList.add("hidden");
           await loadContainers();
           openConfig(j.name);
+          return;
+        }
+        if (j.status === "cancelled") {
+          addJob = null; addBusy(false);
+          $("#add-prog").classList.add("hidden");
+          $("#modal-add").classList.add("hidden");
+          toast("已取消创建");
           return;
         }
         if (j.status === "error") {
@@ -1541,7 +1550,15 @@
       await api("/api/custom-cache/clear", { method: "POST", body: a.dataset.cache ? { file: a.dataset.cache } : {} });
       loadCache();
     });
-    $("#add-cancel").onclick = () => $("#modal-add").classList.add("hidden");
+    $("#add-cancel").onclick = async () => {
+      if (!addJob) { $("#modal-add").classList.add("hidden"); return; }
+      const btn = $("#add-cancel");
+      btn.disabled = true; btn.textContent = "正在取消…";
+      $("#add-stage").textContent = "正在取消，请稍候…";
+      const r = await api("/api/job/cancel", { method: "POST", body: { id: addJob } });
+      // 任务已经自己结束时（done/error），后台轮询会处理；这里只需放开按钮
+      if (!r.ok) { btn.disabled = false; btn.textContent = "取消创建"; toast(r.error || "取消失败"); }
+    };
     $("#add-ok").onclick = async () => {
       const name = $("#add-name").value.trim();
       if (!name) { toast("请输入名称"); return; }

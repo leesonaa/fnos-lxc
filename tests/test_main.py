@@ -288,3 +288,42 @@ class TermSessionTests(unittest.TestCase):
         self.assertTrue(main.close_term_session(sess.sid, "t"))
         self.assertFalse(sess.alive)
 
+
+class CancelTests(unittest.TestCase):
+    def test_run_job_cancel_kills_group(self):
+        import threading, time
+        job = {"id": "t1", "name": "x", "status": "running", "stage": "s"}
+        with main._JOBS_LOCK:
+            main._JOBS["t1"] = job
+        res = {}
+        t = threading.Thread(target=lambda: res.update(main.run_job(job, ["sh", "-c", "sleep 60 & sleep 60"], 120)))
+        t.start()
+        for _ in range(50):
+            if job.get("pid"):
+                break
+            time.sleep(0.05)
+        t0 = time.time()
+        self.assertTrue(main.cancel_job("t1")["ok"])
+        t.join(10)
+        self.assertFalse(t.is_alive())
+        self.assertLess(time.time() - t0, 5)                 # 立刻返回，不是等 60 秒
+        self.assertEqual(res.get("stderr"), "已取消")
+        self.assertFalse(main.run_job(job, ["true"])["ok"])  # 已取消的任务不再启动新进程
+        main._JOBS.pop("t1", None)
+
+    def test_cancel_finished_job_refused(self):
+        main._JOBS["t2"] = {"id": "t2", "name": "x", "status": "done"}
+        self.assertFalse(main.cancel_job("t2")["ok"])
+        self.assertFalse(main.cancel_job("nope")["ok"])
+        main._JOBS.pop("t2", None)
+
+    def test_remove_container_dir(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            c = Path(d) / "c1"
+            (c / "rootfs" / "a").mkdir(parents=True)
+            (c / "rootfs" / "a" / "f").write_text("x")
+            main._remove_container_dir(c)
+            self.assertFalse(c.exists())
+            main._remove_container_dir(c)                    # 不存在也不报错
+
