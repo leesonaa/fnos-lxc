@@ -230,3 +230,61 @@ class AptParseTests(unittest.TestCase):
         self.assertEqual(p("pmstatus:x:abc:y")["kind"], "log")      # 坏数据不抛异常
         self.assertEqual(p("pmstatus:x:150:y")["pct"], 100.0)        # 夹紧到 0-100
 
+
+class TermSessionTests(unittest.TestCase):
+    class FakeClient:
+        def __init__(self):
+            self.frames, self.kicked = [], False
+        def send(self, op, payload):
+            self.frames.append((op, bytes(payload)))
+        def kick(self, graceful=False):
+            self.kicked = True
+        def data(self):
+            return b"".join(p for o, p in self.frames if o == 2)
+
+    def wait(self, pred, t=5):
+        import time
+        end = time.time() + t
+        while time.time() < end:
+            if pred():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_survives_detach_and_replays(self):
+        sess = main.TermSession("t", ["sh", "-c", "echo hello; sleep 0.4; echo world; sleep 30"], 80, 24, slot=False)
+        try:
+            c1 = self.FakeClient()
+            self.assertTrue(sess.attach(c1))
+            self.assertTrue(self.wait(lambda: b"hello" in c1.data()))
+            sess.detach(c1)                                  # 页面断线：任务继续
+            self.assertTrue(sess.alive)
+            self.assertTrue(self.wait(lambda: b"world" in bytes(sess.buf)))   # 断线期间的输出被缓存
+            c2 = self.FakeClient()
+            self.assertTrue(sess.attach(c2))                 # 重连：回放历史
+            d = c2.data()
+            self.assertIn(b"hello", d)
+            self.assertIn(b"world", d)
+            self.assertEqual(c2.frames[0][0], 1)             # 先收到 hello(sid)
+            self.assertIn(sess.sid.encode(), c2.frames[0][1])
+        finally:
+            sess.finish()
+        self.assertNotIn(sess.sid, main._TERMS)
+        self.assertFalse(sess.alive)
+
+    def test_new_attach_kicks_old_and_exit_notifies(self):
+        sess = main.TermSession("t", ["sh", "-c", "sleep 0.5"], 80, 24, slot=False)
+        c1, c2 = self.FakeClient(), self.FakeClient()
+        sess.attach(c1)
+        sess.attach(c2)
+        self.assertTrue(c1.kicked)                           # 同一会话只保留最新连接
+        self.assertTrue(self.wait(lambda: not sess.alive))   # shell 退出 → 会话结束
+        self.assertTrue(any(o == 1 and b"exit" in p for o, p in c2.frames))
+        self.assertFalse(main.close_term_session(sess.sid))
+
+    def test_close_by_sid(self):
+        sess = main.TermSession("t", ["sh", "-c", "sleep 30"], 80, 24, slot=False)
+        self.assertFalse(main.close_term_session(sess.sid, "other"))   # 名字不符不能关
+        self.assertTrue(main.close_term_session(sess.sid, "t"))
+        self.assertFalse(sess.alive)
+

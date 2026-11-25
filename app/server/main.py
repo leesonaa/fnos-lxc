@@ -1952,98 +1952,240 @@ def _terminal_argv(name: str) -> list:
     return argv + ["--", "/bin/sh", "-c", _SHELL]
 
 
-_TERM_SLOTS = threading.BoundedSemaphore(8)  # 同时最多 8 个终端
+_TERM_SLOTS = threading.BoundedSemaphore(8)  # 同时最多 8 个终端会话
+TERM_BUF_MAX = 256 * 1024          # 断线期间保留的输出，重连时回放
+TERM_DETACH_TTL = 12 * 3600        # 没有任何页面连着时，会话最多保留 12 小时
+_TERMS: dict = {}                  # sid -> TermSession
+_TERMS_LOCK = threading.Lock()
 
 
-def terminal_session(handler, name: str, cols: int, rows: int) -> None:
-    """已完成 WebSocket 握手后，把 PTY 与 WebSocket 对接。"""
-    rfile, wfile = handler.rfile, handler.wfile
-    lock = threading.Lock()
-    master, slave = pty.openpty()
-    _set_winsize(master, rows, cols)
-    argv = _terminal_argv(name)
-    # 用 setsid -c 让 PTY 成为控制终端（shell 才有作业控制、Ctrl+C 才生效）。
-    # 不用 preexec_fn：它在多线程服务里可能死锁。没有 setsid 时退化为仅新会话。
-    use_setsid = which("setsid")
-    if use_setsid:
-        argv = ["setsid", "-c"] + argv
-    try:
-        proc = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave,
-                                start_new_session=not use_setsid, close_fds=True)
-    except OSError:
-        os.close(master)
-        raise
-    finally:
-        os.close(slave)
-    alive = threading.Event()
-    alive.set()
+class _WsClient:
+    def __init__(self, wfile, conn):
+        self.wfile, self.conn, self.lock = wfile, conn, threading.Lock()
+
+    def send(self, op: int, payload: bytes) -> None:
+        _ws_send(self.wfile, self.lock, op, payload)
+
+    def kick(self, graceful: bool = False) -> None:
+        """graceful：只关发送方向（FIN），已发出的数据先送达；否则双向关闭以唤醒阻塞的读线程。"""
+        try:
+            self.conn.shutdown(1 if graceful else 2)
+        except OSError:
+            pass
+
+
+class TermSession:
+    """PTY 会话：与 WebSocket 连接解耦。页面断线/刷新/网关超时只会让会话进入“无人连接”状态，
+    其中的任务继续跑，重新连上后回放最近输出并继续接管；只有用户关闭终端、shell 退出或超时才会结束。"""
+
+    def __init__(self, name: str, argv: list, cols: int, rows: int, slot: bool = True):
+        self.sid = secrets.token_urlsafe(16)
+        self.name, self.slot = name, slot
+        self.lock = threading.Lock()
+        self.buf = bytearray()
+        self.client: _WsClient | None = None
+        self.detached_at: float | None = time.monotonic()
+        self.alive = True
+        self._done = False
+        master, slave = pty.openpty()
+        _set_winsize(master, rows, cols)
+        # 用 setsid -c 让 PTY 成为控制终端（shell 才有作业控制、Ctrl+C 才生效）。
+        # 不用 preexec_fn：它在多线程服务里可能死锁。没有 setsid 时退化为仅新会话。
+        use_setsid = which("setsid")
+        if use_setsid:
+            argv = ["setsid", "-c"] + argv
+        try:
+            self.proc = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave,
+                                         start_new_session=not use_setsid, close_fds=True)
+        except OSError:
+            os.close(master)
+            raise
+        finally:
+            os.close(slave)
+        self.master = master
+        with _TERMS_LOCK:
+            _TERMS[self.sid] = self
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    # --- 输出：读 PTY → 缓存 + 推给当前连着的页面 ---
+    def _reader(self) -> None:
+        last_ping = time.monotonic()
+        try:
+            while self.alive:
+                r, _, _ = select.select([self.master], [], [], 5)
+                if r:
+                    try:
+                        data = os.read(self.master, 65536)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    self._feed(data)
+                    continue
+                if self.proc.poll() is not None:
+                    break
+                now = time.monotonic()
+                if self.detached_at is not None and now - self.detached_at > TERM_DETACH_TTL:
+                    break
+                if self.client is not None and now - last_ping > 30:
+                    last_ping = now
+                    self._push(9, b"")
+        finally:
+            self.finish()
+
+    def _push(self, op: int, payload: bytes) -> None:
+        with self.lock:
+            c = self.client
+            if c is None:
+                return
+            try:
+                c.send(op, payload)
+            except OSError:
+                self.client, self.detached_at = None, time.monotonic()
+                c.kick()
+
+    def _feed(self, data: bytes) -> None:
+        with self.lock:
+            self.buf += data
+            if len(self.buf) > TERM_BUF_MAX:
+                del self.buf[: len(self.buf) - TERM_BUF_MAX]
+        self._push(2, data)
+
+    # --- 页面接管 / 释放 ---
+    def attach(self, client: _WsClient) -> bool:
+        with self.lock:
+            if not self.alive:
+                return False
+            old, self.client, self.detached_at = self.client, client, None
+            try:
+                client.send(1, json.dumps({"type": "hello", "sid": self.sid}).encode())
+                for i in range(0, len(self.buf), 32768):
+                    client.send(2, bytes(self.buf[i:i + 32768]))
+            except OSError:
+                self.client, self.detached_at = None, time.monotonic()
+                return False
+        if old is not None:
+            old.kick()
+        return True
+
+    def detach(self, client: _WsClient) -> None:
+        with self.lock:
+            if self.client is client:
+                self.client, self.detached_at = None, time.monotonic()
+
+    def write(self, data: bytes) -> None:
+        if self.alive:
+            try:
+                os.write(self.master, data)
+            except OSError:
+                pass
+
+    def resize(self, rows: int, cols: int) -> None:
+        _set_winsize(self.master, rows, cols)
+
+    # --- 结束：杀进程组、释放资源 ---
+    def finish(self) -> None:
+        with self.lock:
+            if self._done:
+                return
+            self._done = True
+            self.alive = False
+            c, self.client = self.client, None
+        with _TERMS_LOCK:
+            _TERMS.pop(self.sid, None)
+        for sig in (signal.SIGHUP, signal.SIGKILL):
+            try:
+                os.killpg(self.proc.pid, sig)
+            except OSError:
+                break
+            try:
+                self.proc.wait(timeout=2)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        try:
+            os.close(self.master)
+        except OSError:
+            pass
+        if self.slot:
+            try:
+                _TERM_SLOTS.release()
+            except ValueError:
+                pass
+        if c is not None:
+            try:
+                c.send(1, b'{"type":"exit"}')
+                c.send(8, struct.pack("!H", 1000))
+            except OSError:
+                pass
+            c.kick(graceful=True)
+
+
+def terminal_session(handler, name: str, cols: int, rows: int, sid: str = "", slot: bool = True) -> None:
+    """已完成 WebSocket 握手后：新建会话，或用 sid 接管已有会话；本函数只处理这一条连接，连接断开不会杀会话。"""
+    rfile = handler.rfile
+    client = _WsClient(handler.wfile, handler.connection)
     try:
         handler.connection.settimeout(WS_IDLE_TIMEOUT)
     except OSError:
         pass
-
-    def pump():
-        last_ping = time.monotonic()
-        try:
-            while alive.is_set():
-                r, _, _ = select.select([master], [], [], 5)
-                if r:
-                    data = os.read(master, 65536)
-                    if not data:
-                        break
-                    _ws_send(wfile, lock, 2, data)
-                elif time.monotonic() - last_ping > 30:
-                    _ws_send(wfile, lock, 9, b"")
-                    last_ping = time.monotonic()
-                if proc.poll() is not None and not r:
-                    break
-        except OSError:
-            pass
-        finally:
-            alive.clear()
+    sess = None
+    if sid:
+        with _TERMS_LOCK:
+            sess = _TERMS.get(sid)
+        if not sess or sess.name != name or not sess.attach(client):
             try:
-                _ws_send(wfile, lock, 8, struct.pack("!H", 1000))
-                handler.connection.shutdown(2)
+                client.send(1, b'{"type":"gone"}')
+                client.send(8, struct.pack("!H", 1000))
             except OSError:
                 pass
-
-    t = threading.Thread(target=pump, daemon=True)
-    t.start()
+            return
+        sess.resize(rows, cols)
+    else:
+        try:
+            sess = TermSession(name, _terminal_argv(name), cols, rows, slot=slot)
+        except OSError:
+            raise                      # 名额由 handle_term 释放
+        handler._slot_owned = True
+        if not sess.attach(client):
+            sess.finish()
+            return
     try:
-        while alive.is_set():
+        while sess.alive:
             op, payload = _ws_recv(rfile)
             if op == 8:
                 break
             if op == 9:
-                _ws_send(wfile, lock, 10, payload)
+                try:
+                    client.send(10, payload)
+                except OSError:
+                    break
             elif op == 2:
-                os.write(master, payload)
+                sess.write(payload)
             elif op == 1:
                 try:
                     msg = json.loads(payload.decode("utf-8"))
-                    if msg.get("type") == "resize":
-                        _set_winsize(master, max(1, min(500, int(msg.get("rows", 24)))),
-                                     max(1, min(1000, int(msg.get("cols", 80)))))
+                    t = msg.get("type")
+                    if t == "resize":
+                        sess.resize(max(1, min(500, int(msg.get("rows", 24)))), max(1, min(1000, int(msg.get("cols", 80)))))
+                    elif t == "close":
+                        sess.finish()
+                        break
                 except (ValueError, TypeError, AttributeError):
                     continue
     except OSError:
         pass
     finally:
-        alive.clear()
-        for sig in (signal.SIGHUP, signal.SIGKILL):
-            try:
-                os.killpg(proc.pid, sig)
-            except OSError:
-                break
-            try:
-                proc.wait(timeout=2)
-                break
-            except subprocess.TimeoutExpired:
-                continue
-        try:
-            os.close(master)
-        except OSError:
-            pass
+        sess.detach(client)   # 只是断开这一条连接，shell 里的任务继续跑
+
+
+def close_term_session(sid: str, name: str = "") -> bool:
+    with _TERMS_LOCK:
+        sess = _TERMS.get(sid)
+    if not sess or (name and sess.name != name):
+        return False
+    sess.finish()
+    return True
 
 
 def list_templates_hint() -> list:
@@ -2239,15 +2381,23 @@ class Handler(BaseHTTPRequestHandler):
         if container_state(name) != "RUNNING":
             self._json(409, {"ok": False, "error": "容器未运行"})
             return
-        if not _TERM_SLOTS.acquire(blocking=False):
+        sid = (qs.get("sid") or [""])[0]
+        slot = not sid
+        if slot and not _TERM_SLOTS.acquire(blocking=False):
             self._json(429, {"ok": False, "error": "终端数量已达上限，请先关闭其它终端"})
             return
+        self._slot_owned = False   # 会话创建成功后由 TermSession 负责释放名额
         try:
-            self._handle_term_ws(name, key, qs)
-        finally:
-            _TERM_SLOTS.release()
+            self._handle_term_ws(name, key, qs, sid, slot)
+        except BaseException:
+            if slot and not self._slot_owned:
+                _TERM_SLOTS.release()
+            raise
+        else:
+            if slot and not self._slot_owned:
+                _TERM_SLOTS.release()
 
-    def _handle_term_ws(self, name, key, qs):
+    def _handle_term_ws(self, name, key, qs, sid="", slot=True):
         accept = base64.b64encode(hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
         self.send_response(101, "Switching Protocols")
         self.send_header("Upgrade", "websocket")
@@ -2261,7 +2411,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             cols, rows = 80, 24
         self.close_connection = True
-        terminal_session(self, name, cols, rows)
+        terminal_session(self, name, cols, rows, sid, slot)
 
     def handle_api_get(self, path, qs):
         cfg = load_config()
@@ -2406,6 +2556,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"ok": False, "error": "invalid name"})
                 return
             self._json(200, {"ok": True, "token": issue_term_token(name)})
+            return
+
+        if path == "/api/container/term-close":
+            ok = close_term_session(str(body.get("sid", "")), clean_name(body.get("name", "")))
+            self._json(200, {"ok": True, "closed": ok})
             return
 
         if path == "/api/container/autostart":

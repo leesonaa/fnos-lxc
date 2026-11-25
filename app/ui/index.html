@@ -1864,7 +1864,9 @@
     }
     function termDestroy(s) {
       s.closed = true;
-      clearTimeout(s.quietTimer);
+      clearTimeout(s.quietTimer); clearTimeout(s.retryT); clearInterval(s.hb);
+      // 关闭终端 = 结束服务端的 shell（普通断线不会结束，可续接）
+      if (s.sid) api("/api/container/term-close", { method: "POST", body: { name: s.name, sid: s.sid } }).catch(() => {});
       if (s.ws) { const w = s.ws; s.ws = null; try { w.close(); } catch (e) {} }
       if (s.ro) { s.ro.disconnect(); s.ro = null; }
       try { s.term.dispose(); } catch (e) {}
@@ -1876,25 +1878,47 @@
       }
       termRenderDock();
     }
-    async function termConnect(s) {
+    async function termConnect(s, resume) {
       const seq = ++s.seq;
+      clearTimeout(s.retryT);
       if (s.ws) { const old = s.ws; s.ws = null; try { old.close(); } catch (e) {} }
       s.dead = false;
-      termShowStatus(s, "连接中…", false);
+      termShowStatus(s, resume ? "重新连接中…" : "连接中…", false);
       try { s.fit.fit(); } catch (e) {}
       const t = await api("/api/container/term-token", { method: "POST", body: { name: s.name } });
       if (s.closed || seq !== s.seq) return;
-      if (!t.ok) { s.dead = true; termShowStatus(s, t.error || "认证失败", true); termRenderDock(); return; }
+      if (!t.ok) {
+        if (resume) { termRetry(s); return; }
+        s.dead = true; termShowStatus(s, t.error || "认证失败", true); termRenderDock(); return;
+      }
       const proto = location.protocol === "https:" ? "wss" : "ws";
       const base = new URL(document.baseURI).pathname.replace(/\/$/, "");
-      const ws = new WebSocket(`${proto}://${location.host}${base}/api/container/${encodeURIComponent(s.name)}/term?token=${encodeURIComponent(t.token)}&cols=${s.term.cols}&rows=${s.term.rows}`);
+      const sidq = s.sid ? `&sid=${encodeURIComponent(s.sid)}` : "";
+      const ws = new WebSocket(`${proto}://${location.host}${base}/api/container/${encodeURIComponent(s.name)}/term?token=${encodeURIComponent(t.token)}&cols=${s.term.cols}&rows=${s.term.rows}${sidq}`);
       ws.binaryType = "arraybuffer";
       s.ws = ws;
-      ws.onopen = () => { termShowStatus(s, "", false); if (s === termActive) s.term.focus(); termRenderDock(); };
+      ws.onopen = () => {
+        s.tries = 0;
+        termShowStatus(s, "", false);
+        if (s.sid) { s.term.reset(); s.quietUntil = Date.now() + 800; }  // 续接：服务端会回放最近输出，先清屏避免重复
+        if (s === termActive) s.term.focus();
+        termRenderDock();
+        clearInterval(s.hb);   // 应用层心跳：网关可能吞掉 ping/pong，空闲连接会被判死
+        s.hb = setInterval(() => { if (s.ws === ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "ping" })); }, 20000);
+      };
       ws.onmessage = (e) => {
-        if (!(e.data instanceof ArrayBuffer)) return;
+        if (!(e.data instanceof ArrayBuffer)) {
+          let m = null; try { m = JSON.parse(e.data); } catch (err) { return; }
+          if (m.type === "hello") { s.sid = m.sid; termSendResize(s); }
+          else if (m.type === "gone" || m.type === "exit") {
+            s.exited = true; s.sid = null;
+            s.term.write(`\r\n\x1b[90m[${m.type === "exit" ? "终端已退出" : "会话已结束"}]\x1b[0m\r\n`);
+            s.dead = true; termShowStatus(s, m.type === "exit" ? "已退出" : "会话已结束", true); termRenderDock();
+          }
+          return;
+        }
         s.term.write(new Uint8Array(e.data));
-        if (s !== termActive || cv("modal-term").classList.contains("hidden")) {
+        if ((s !== termActive || cv("modal-term").classList.contains("hidden")) && Date.now() > (s.quietUntil || 0)) {
           // 有输出 → 黄色（运行中）；2.5 秒没有新输出 → 恢复绿色（空闲/已完成）
           const wasBusy = s.busy;
           s.busy = true;
@@ -1904,12 +1928,27 @@
         }
       };
       ws.onclose = () => {
-        if (s.closed || ws !== s.ws) return;
+        clearInterval(s.hb);
+        if (s.closed || ws !== s.ws || s.exited) return;
+        if (s.sid) { termRetry(s); return; }   // 有会话 id：服务端任务还在，自动重连续接
         s.term.write("\r\n\x1b[90m[连接已关闭]\x1b[0m\r\n");
         s.dead = true;
         termShowStatus(s, "已断开", true);
         termRenderDock();
       };
+    }
+    // 断线自动重连（任务仍在服务端运行）：1,2,4,8… 秒退避，最多约 10 次
+    function termRetry(s) {
+      if (s.closed || s.exited) return;
+      s.tries = (s.tries || 0) + 1;
+      if (s.tries > 10) {
+        s.dead = true;
+        s.term.write("\r\n\x1b[90m[连接已断开，点「重新连接」可继续接管仍在运行的任务]\x1b[0m\r\n");
+        termShowStatus(s, "已断开", true); termRenderDock();
+        return;
+      }
+      termShowStatus(s, `连接中断，正在重连（${s.tries}）…`, false);
+      s.retryT = setTimeout(() => termConnect(s, true), Math.min(8000, 1000 * 2 ** (s.tries - 1)));
     }
     function openTerm(name) {
       const s = { id: ++termIdSeq, name, seq: 0, el: document.createElement("div"), unread: false, dead: false, status: "", canReconnect: false };
@@ -1932,7 +1971,7 @@
       requestAnimationFrame(() => { try { s.fit.fit(); } catch (e) {} termConnect(s); });
       termRenderDock();
     }
-    cv("term-reconnect").onclick = () => { if (termActive) termConnect(termActive); };
+    cv("term-reconnect").onclick = () => { if (termActive) { termActive.tries = 0; termConnect(termActive, !!termActive.sid); } };
     cv("term-min").onclick = termMinimize;
     cv("term-close").onclick = () => { if (termActive) termDestroy(termActive); };
 
