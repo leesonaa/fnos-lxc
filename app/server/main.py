@@ -2274,9 +2274,6 @@ class TermSession:
         finally:
             os.close(slave)
         self.master = master
-        self.base_pg: int | None = None   # 空闲时（提示符）的前台进程组，用来判断“有任务在跑”
-        self.fg_busy = False
-        self.born = time.monotonic()
         with _TERMS_LOCK:
             _TERMS[self.sid] = self
         threading.Thread(target=self._reader, daemon=True).start()
@@ -2286,7 +2283,7 @@ class TermSession:
         last_ping = time.monotonic()
         try:
             while self.alive:
-                r, _, _ = select.select([self.master], [], [], 1)
+                r, _, _ = select.select([self.master], [], [], 5)
                 if r:
                     try:
                         data = os.read(self.master, 65536)
@@ -2298,7 +2295,6 @@ class TermSession:
                     continue
                 if self.proc.poll() is not None:
                     break
-                self._poll_fg()
                 now = time.monotonic()
                 if self.detached_at is not None and now - self.detached_at > TERM_DETACH_TTL:
                     break
@@ -2307,38 +2303,6 @@ class TermSession:
                     self._push(9, b"")
         finally:
             self.finish()
-
-    def _fg_pgrp(self) -> int:
-        try:
-            return os.tcgetpgrp(self.master)
-        except OSError:
-            return 0
-
-    def _poll_fg(self) -> None:
-        """前台进程组 ≠ 提示符时的进程组 ⇒ 有命令在跑（哪怕它没有任何输出，比如卡在联网）。"""
-        pg = self._fg_pgrp()
-        if pg <= 0:
-            return
-        if self.base_pg is None:
-            if time.monotonic() - self.born > 1.5:     # 等登录脚本跑完、停在提示符后再记基线
-                self.base_pg = pg
-            return
-        busy = pg != self.base_pg
-        if busy != self.fg_busy:
-            self.fg_busy = busy
-            self._push(1, json.dumps({"type": "fg", "busy": busy}).encode())
-
-    def _ctrl_c_fallback(self) -> None:
-        """Ctrl+C 已写入 PTY；若 0.4 秒后前台任务仍在，主动给前台进程组补发 SIGINT
-        （个别环境里 tty 驱动只回显 ^C 而没有把信号送到容器内的进程组）。"""
-        time.sleep(0.4)
-        pg = self._fg_pgrp()
-        if not self.alive or pg <= 0 or self.base_pg is None or pg == self.base_pg or pg == self.proc.pid:
-            return
-        try:
-            os.killpg(pg, signal.SIGINT)
-        except OSError:
-            pass
 
     def _push(self, op: int, payload: bytes) -> None:
         with self.lock:
@@ -2366,7 +2330,6 @@ class TermSession:
             old, self.client, self.detached_at = self.client, client, None
             try:
                 client.send(1, json.dumps({"type": "hello", "sid": self.sid}).encode())
-                client.send(1, json.dumps({"type": "fg", "busy": self.fg_busy}).encode())
                 for i in range(0, len(self.buf), 32768):
                     client.send(2, bytes(self.buf[i:i + 32768]))
             except OSError:
@@ -2387,8 +2350,6 @@ class TermSession:
                 os.write(self.master, data)
             except OSError:
                 pass
-            if b"\x03" in data:
-                threading.Thread(target=self._ctrl_c_fallback, daemon=True).start()
 
     def resize(self, rows: int, cols: int) -> None:
         _set_winsize(self.master, rows, cols)

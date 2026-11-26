@@ -793,7 +793,7 @@
         <span class="hint" id="term-status" style="margin:0"></span>
         <div class="spacer"></div>
         <button id="term-reconnect" class="hidden">重新连接</button>
-        <button id="term-min" class="iconbtn" title="最小化（终端保持连接，可在顶部灵动岛恢复，或另开新终端）" aria-label="最小化">&#8211;</button>
+        <button id="term-min" class="iconbtn" title="最小化（终端保持连接，可在左下角恢复，或另开新终端）" aria-label="最小化">&#8211;</button>
         <button id="term-close" class="iconbtn" title="关闭此终端" aria-label="关闭">&#10005;</button>
       </div>
       <div id="term-boxes" style="flex:1;min-height:0;position:relative"></div>
@@ -2002,10 +2002,10 @@
     }
     function islNoticeClose() { clearTimeout(isl.noticeT); isl.notice = null; islRender(); }
     function islSessions() {  // 正在忙（黄点）的排最前，已断开的排最后，其余保持打开顺序
-      const rank = (s) => (s.dead ? 2 : s.busy || s.fgBusy ? 0 : 1);
+      const rank = (s) => (s.dead ? 2 : s.busy ? 0 : 1);
       return termSessions.map((s, i) => [s, i]).sort((a, b) => rank(a[0]) - rank(b[0]) || a[1] - b[1]).map((v) => v[0]);
     }
-    const dotCls = (s) => (s.dead ? "off" : s.busy || s.fgBusy ? "new" : "");
+    const dotCls = (s) => (s.dead ? "off" : s.busy ? "new" : "");
     function islHtml() {
       if (isl.toast) return `<div class="isl-toast ${isl.toast.cls}">${ISL_ICON[isl.toast.cls]}<span>${esc(isl.toast.msg)}</span></div>`;
       if (isl.notice) {
@@ -2076,7 +2076,7 @@
       try { s.term.dispose(); } catch (e) {}
       s.el.remove();
       termSessions.splice(termSessions.indexOf(s), 1);
-      if (termActive === s) {  // 关掉的是当前终端：收起窗口，其余终端留在灵动岛，不会被自动恢复
+      if (termActive === s) {  // 关掉的是当前终端：收起窗口，其余终端留在左下角，不会被自动恢复
         termActive = null;
         cv("modal-term").classList.add("hidden");
       }
@@ -2114,7 +2114,6 @@
         if (!(e.data instanceof ArrayBuffer)) {
           let m = null; try { m = JSON.parse(e.data); } catch (err) { return; }
           if (m.type === "hello") { s.sid = m.sid; termSendResize(s); }
-          else if (m.type === "fg") { if (!!m.busy !== !!s.fgBusy) { s.fgBusy = !!m.busy; termRenderDock(); } }
           else if (m.type === "gone" || m.type === "exit") {
             s.exited = true; s.sid = null;
             s.term.write(`\r\n\x1b[90m[${m.type === "exit" ? "终端已退出" : "会话已结束"}]\x1b[0m\r\n`);

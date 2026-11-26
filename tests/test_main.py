@@ -242,21 +242,6 @@ class TermSessionTests(unittest.TestCase):
         def data(self):
             return b"".join(p for o, p in self.frames if o == 2)
 
-    def test_fg_busy_and_ctrl_c(self):
-        import json
-        c = self.FakeClient()
-        sess = main.TermSession("t", ["bash", "--norc", "-i"], 80, 24, slot=False)
-        try:
-            sess.attach(c)
-            self.assertTrue(self.wait(lambda: sess.base_pg is not None, 6))
-            sess.write(b"sleep 30\n")
-            self.assertTrue(self.wait(lambda: sess.fg_busy, 4))
-            self.assertTrue(any(o == 1 and json.loads(p).get("busy") is True for o, p in c.frames))
-            sess.write(b"\x03")
-            self.assertTrue(self.wait(lambda: not sess.fg_busy, 4))
-        finally:
-            sess.finish()
-
     def wait(self, pred, t=5):
         import time
         end = time.time() + t
