@@ -227,14 +227,19 @@ class LaunchInstallTests(unittest.TestCase):
         log = d / "install.log"
         old = os.environ["PATH"]
         os.environ["PATH"] = f"{cli.parent}:{old}"
+        real_which = updater.shutil.which
+        # 固定走「直接启动」分支：CI 机器上有 systemd，systemd-run 会把任务丢到别的上下文里，测试读不到日志
+        updater.shutil.which = lambda n, *a, **k: None if n == "systemd-run" else real_which(n, *a, **k)
         try:
             self.assertEqual(updater.launch_install(fpk, log, 3), "")
-            for _ in range(80):
+            for _ in range(100):
                 if log.exists() and "EXIT=" in log.read_text():
                     break
                 time.sleep(0.1)
         finally:
+            updater.shutil.which = real_which
             os.environ["PATH"] = old
+        self.assertTrue(log.exists(), "install.log 没有生成")
         txt = log.read_text()
         self.assertIn("install-local -d /tmp/fnos-lxc-upgrade.", txt)
         self.assertIn("-v 3", txt)
