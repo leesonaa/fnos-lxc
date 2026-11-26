@@ -277,7 +277,7 @@ def launch_install(fpk: Path, log: Path) -> str:
     if not cli:
         return "找不到 appcenter-cli，无法自动安装。请把下载好的安装包手动安装：" + str(fpk)
     log.parent.mkdir(parents=True, exist_ok=True)
-    script = (f"sleep 2; echo \"== $(date) install-fpk {shlex.quote(str(fpk))}\" >> {shlex.quote(str(log))}; "
+    script = (f"sleep 2; echo \"== $(date) install-fpk {shlex.quote(str(fpk))}\" > {shlex.quote(str(log))}; "
               f"{shlex.quote(cli)} install-fpk {shlex.quote(str(fpk))} >> {shlex.quote(str(log))} 2>&1; "
               f"echo \"EXIT=$?\" >> {shlex.quote(str(log))}")
     if shutil.which("systemd-run") and os.path.isdir("/run/systemd/system"):

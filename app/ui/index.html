@@ -1747,12 +1747,19 @@
     let updJob = "";
     // 安装会重启服务：先等它下线、再等它回来；回来后刷新页面加载新版界面
     async function updWaitRestart(oldVer) {
-      const t0 = Date.now(); let sawDown = false;
-      while (Date.now() - t0 < 240000) {
+      const t0 = Date.now(); let sawDown = false, exit0At = 0;
+      while (Date.now() - t0 < 300000) {
         await new Promise((res) => setTimeout(res, 2000));
         const st = await api("/api/update/status");
-        if (!st.ok || !st.current) { sawDown = true; continue; }
+        const sec = Math.round((Date.now() - t0) / 1000);
+        if (!st.ok || !st.current) { sawDown = true; $("#upd-detail").textContent = `应用正在重启…（已等待 ${sec} 秒）`; continue; }
         if (sawDown || st.current !== oldVer) { toast("更新完成，正在刷新页面"); setTimeout(() => location.reload(), 800); return; }
+        const lg = (st.install && st.install.log) || "";
+        const last = lg.split("\n").filter(Boolean).pop() || "等待飞牛应用中心…";
+        $("#upd-detail").textContent = `已等待 ${sec} 秒 · ${last}`;
+        const m = lg.match(/EXIT=(\d+)/);
+        if (m && m[1] !== "0") { updBanner("err", `安装命令失败（退出码 ${m[1]}）`, lg); return; }
+        if (m) { exit0At = exit0At || Date.now(); if (Date.now() - exit0At > 20000) { updBanner("err", "安装命令已返回成功，但应用版本没有变化", lg + "\n可能与当前版本相同、或安装包未被应用中心接受；请到飞牛应用中心确认。"); return; } }
       }
       const st = await api("/api/update/status");
       updBanner("err", "没有等到应用重启", (st.install && st.install.log ? "安装日志：\n" + st.install.log : "请稍后手动刷新页面，或在飞牛应用中心查看安装结果。"));
