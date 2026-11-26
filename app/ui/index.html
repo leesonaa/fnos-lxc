@@ -793,7 +793,7 @@
         <span class="hint" id="term-status" style="margin:0"></span>
         <div class="spacer"></div>
         <button id="term-reconnect" class="hidden">重新连接</button>
-        <button id="term-min" class="iconbtn" title="最小化（终端保持连接，可在左下角恢复，或另开新终端）" aria-label="最小化">&#8211;</button>
+        <button id="term-min" class="iconbtn" title="最小化（终端保持连接，可在顶部灵动岛恢复，或另开新终端）" aria-label="最小化">&#8211;</button>
         <button id="term-close" class="iconbtn" title="关闭此终端" aria-label="关闭">&#10005;</button>
       </div>
       <div id="term-boxes" style="flex:1;min-height:0;position:relative"></div>
@@ -2076,7 +2076,7 @@
       try { s.term.dispose(); } catch (e) {}
       s.el.remove();
       termSessions.splice(termSessions.indexOf(s), 1);
-      if (termActive === s) {  // 关掉的是当前终端：收起窗口，其余终端留在左下角，不会被自动恢复
+      if (termActive === s) {  // 关掉的是当前终端：收起窗口，其余终端留在灵动岛，不会被自动恢复
         termActive = null;
         cv("modal-term").classList.add("hidden");
       }
