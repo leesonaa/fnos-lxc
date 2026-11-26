@@ -2087,7 +2087,7 @@ def _update_worker(job: dict, reinstall: bool) -> None:
         if err:
             return _job_set(job, status="error", error=err)
         _job_set(job, stage="下载完成，交给飞牛应用中心安装…", progress=93)
-        err = updater.launch_install(path, ddir / "install.log")
+        err = updater.launch_install(path, ddir / "install.log", updater.volume_index(Path(__file__), DATA_DIR))
         if err:
             return _job_set(job, status="error", error=err)
         st = updater.load_state(sp)

@@ -192,3 +192,52 @@ class NetworkTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LaunchInstallTests(unittest.TestCase):
+    def test_volume_index(self):
+        self.assertEqual(updater.volume_index("/vol2/@appcenter/x"), 2)
+        self.assertEqual(updater.volume_index("/tmp/nope", "/vol12"), 12)
+        self.assertEqual(updater.volume_index("/tmp/nope"), 0)
+
+    def test_refuses_without_volume(self):
+        import os, tempfile
+        b = Path(tempfile.mkdtemp())
+        (b / "appcenter-cli").write_text("#!/bin/sh\nexit 0\n")
+        (b / "appcenter-cli").chmod(0o755)
+        old = os.environ["PATH"]
+        os.environ["PATH"] = f"{b}:{old}"
+        try:
+            self.assertIn("存储空间", updater.launch_install(Path("/tmp/x.fpk"), Path("/tmp/x.log"), 0))
+        finally:
+            os.environ["PATH"] = old
+
+    def test_install_local_runs_with_extracted_dir(self):
+        import os, tarfile, tempfile, time
+        d = Path(tempfile.mkdtemp())
+        (d / "src").mkdir()
+        (d / "src" / "manifest").write_text("version=9.9.9\n")
+        fpk = d / "a.fpk"
+        with tarfile.open(fpk, "w:gz") as t:
+            t.add(d / "src" / "manifest", arcname="manifest")
+        cli = d / "bin" / "appcenter-cli"
+        cli.parent.mkdir()
+        cli.write_text('#!/bin/sh\necho "ARGS $*" \nls "$3"\necho "KEEP=$wizard_keep_data"\n')
+        cli.chmod(0o755)
+        log = d / "install.log"
+        old = os.environ["PATH"]
+        os.environ["PATH"] = f"{cli.parent}:{old}"
+        try:
+            self.assertEqual(updater.launch_install(fpk, log, 3), "")
+            for _ in range(80):
+                if log.exists() and "EXIT=" in log.read_text():
+                    break
+                time.sleep(0.1)
+        finally:
+            os.environ["PATH"] = old
+        txt = log.read_text()
+        self.assertIn("install-local -d /tmp/fnos-lxc-upgrade.", txt)
+        self.assertIn("-v 3", txt)
+        self.assertIn("manifest", txt)       # 解压出来的目录里有 manifest
+        self.assertIn("KEEP=true", txt)      # 卸载环节要求保留数据
+        self.assertIn("EXIT=0", txt)

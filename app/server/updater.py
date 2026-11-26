@@ -271,15 +271,38 @@ def installer_cmd() -> str:
     return shutil.which("appcenter-cli") or ""
 
 
-def launch_install(fpk: Path, log: Path) -> str:
-    """在独立进程里执行 appcenter-cli install-fpk（安装会重启本服务，不能依附在当前进程上）。返回错误，空串表示已启动。"""
+def volume_index(*paths) -> int:
+    """应用装在哪个存储空间：从 /volN/... 的真实路径里取 N。install-local 重装时必须带 -v。"""
+    for p in paths:
+        try:
+            m = re.match(r"^/vol(\d+)(?:/|$)", os.path.realpath(str(p)))
+        except OSError:
+            continue
+        if m:
+            return int(m.group(1))
+    return 0
+
+
+def launch_install(fpk: Path, log: Path, volume: int) -> str:
+    """在独立进程里升级：解压 .fpk 到临时目录，用 appcenter-cli install-local 重装
+    （实测 install-fpk 对已安装的应用是空操作，install-local 会停止→卸载→安装→启动，并保留数据）。
+    重装会停掉并卸载本服务，所以必须脱离当前进程；失败时用同一目录再重试一次，避免卸载后没装上。"""
     cli = installer_cmd()
     if not cli:
-        return "找不到 appcenter-cli，无法自动安装。请把下载好的安装包手动安装：" + str(fpk)
+        return "找不到 appcenter-cli，无法自动安装。安装包在：" + str(fpk)
+    if volume < 1:
+        return "无法确定应用所在的存储空间，不能自动安装。请在应用中心「手动安装」这个文件：" + str(fpk)
     log.parent.mkdir(parents=True, exist_ok=True)
-    script = (f"sleep 2; echo \"== $(date) install-fpk {shlex.quote(str(fpk))}\" > {shlex.quote(str(log))}; "
-              f"{shlex.quote(cli)} install-fpk {shlex.quote(str(fpk))} >> {shlex.quote(str(log))} 2>&1; "
-              f"echo \"EXIT=$?\" >> {shlex.quote(str(log))}")
+    q = shlex.quote
+    script = (
+        f"sleep 2; D=$(mktemp -d /tmp/fnos-lxc-upgrade.XXXXXX) || exit 1; "
+        f"echo \"== $(date) install-local from {q(str(fpk))} volume={volume}\" > {q(str(log))}; "
+        f"export wizard_keep_data=true keep_data=true; "   # 卸载环节保留容器与数据
+        f"if ! tar -xzf {q(str(fpk))} -C \"$D\" >> {q(str(log))} 2>&1; then echo EXIT=1 >> {q(str(log))}; exit 1; fi; "
+        f"{q(cli)} install-local -d \"$D\" -v {volume} >> {q(str(log))} 2>&1; R=$?; "
+        f"if [ $R -ne 0 ]; then echo \"== 第一次失败(EXIT=$R)，重试\" >> {q(str(log))}; sleep 3; "
+        f"{q(cli)} install-local -d \"$D\" -v {volume} >> {q(str(log))} 2>&1; R=$?; fi; "
+        f"echo \"EXIT=$R\" >> {q(str(log))}; rm -rf \"$D\"")
     if shutil.which("systemd-run") and os.path.isdir("/run/systemd/system"):
         argv = ["systemd-run", "--collect", f"--unit=fnos-lxc-upgrade-{int(time.time())}", "sh", "-c", script]
     else:
@@ -294,7 +317,7 @@ def launch_install(fpk: Path, log: Path) -> str:
 
 def log_tail(log: Path, n: int = 12) -> str:
     try:
-        return "\n".join(log.read_text(errors="replace").splitlines()[-n:])
+        return "\n".join(log.read_text(errors="replace").replace("\r", "\n").splitlines()[-n:])
     except OSError:
         return ""
 
