@@ -30,6 +30,7 @@ from urllib.parse import parse_qs, urlparse
 import customfs
 import guestnet
 import lxcconf
+import updater
 import oplog
 import rootstore
 
@@ -2001,6 +2002,130 @@ def save_container_raw(name: str, text: str) -> dict:
     return {"ok": True, "needs_restart": container_state(name) in ("RUNNING", "FROZEN")}
 
 
+# ----- 检查更新 / 在线升级 -----
+
+def _update_state_path() -> Path:
+    return DATA_DIR / "update.json"
+
+
+def update_settings() -> dict:
+    return updater.validate_settings(load_config().get("update") or {})[0]
+
+
+def _public_latest(st: dict) -> dict | None:
+    lt = st.get("latest")
+    if not lt:
+        return None
+    a = updater.choose_asset(lt.get("assets") or [])
+    return {"version": lt["version"], "tag": lt["tag"], "name": lt["name"], "notes": lt["notes"],
+            "html_url": lt["html_url"], "published_at": lt["published_at"],
+            "asset": {"name": a["name"], "size": a["size"]} if a else None}
+
+
+def update_status() -> dict:
+    """只读本地缓存，不访问网络（页面打开/轮询用）。"""
+    st = updater.load_state(_update_state_path())
+    cur = updater.current_version()
+    lt = _public_latest(st)
+    with _JOBS_LOCK:
+        running = next((j["id"] for j in _JOBS.values() if j.get("kind") == "update" and j["status"] == "running"), "")
+    inst = st.get("install") or {}
+    return {"ok": True, "current": cur, "latest": lt,
+            "available": bool(lt and updater.is_newer(lt["version"], cur)),
+            "can_install": bool(updater.installer_cmd()),
+            "last_check": st.get("last_check", 0), "last_error": st.get("last_error", ""),
+            "cooldown": bool(st.get("cooldown")), "settings": update_settings(), "installing": running,
+            "install": ({"target": inst.get("target", ""), "from": inst.get("from", ""), "at": inst.get("at", 0),
+                         "done": bool(inst.get("target") and not updater.is_newer(inst["target"], cur)),
+                         "log": updater.log_tail(DATA_DIR / "update" / "install.log")} if inst else None)}
+
+
+def update_check() -> dict:
+    st = updater.check(update_settings(), updater.load_state(_update_state_path()), force=True)
+    updater.save_state(_update_state_path(), st)
+    oplog.log("update.check", ok=not st.get("last_error"), detail=st.get("last_error") or (st.get("latest") or {}).get("tag", ""))
+    return update_status()
+
+
+def update_save_settings(body: dict) -> dict:
+    s, err = updater.validate_settings(body if isinstance(body, dict) else {})
+    if err:
+        return {"ok": False, "error": err}
+    cfg = load_config()
+    cfg["update"] = s
+    save_config(cfg)
+    return update_status()
+
+
+def _update_worker(job: dict, reinstall: bool) -> None:
+    try:
+        s = update_settings()
+        sp = _update_state_path()
+        _job_set(job, stage="获取版本信息", progress=3)
+        st = updater.check(s, updater.load_state(sp), force=True)
+        updater.save_state(sp, st)
+        lt = st.get("latest")
+        if not lt:
+            return _job_set(job, status="error", error=st.get("last_error") or "无法获取版本信息")
+        cur = updater.current_version()
+        if not reinstall and not updater.is_newer(lt["version"], cur):
+            return _job_set(job, status="error", error="当前已是最新版本")
+        asset = updater.choose_asset(lt["assets"])
+        if not asset:
+            return _job_set(job, status="error", error="该版本没有可安装的 .fpk 附件")
+        ddir = DATA_DIR / "update"
+        for old in ddir.glob("*.fpk*"):
+            old.unlink(missing_ok=True)
+
+        def prog(got, total, label):
+            _job_set(job, downloaded=got, total=total, stage=f"下载 {asset['name']}（{label}）",
+                     progress=5 + (min(85, int(got * 85 / total)) if total else 0))
+
+        path, err = updater.download(asset, s, ddir, prog, lambda: bool(job.get("cancel")))
+        if job.get("cancel"):
+            return _job_set(job, status="cancelled", stage="已取消", error="已取消")
+        if err:
+            return _job_set(job, status="error", error=err)
+        _job_set(job, stage="下载完成，交给飞牛应用中心安装…", progress=93)
+        err = updater.launch_install(path, ddir / "install.log")
+        if err:
+            return _job_set(job, status="error", error=err)
+        st = updater.load_state(sp)
+        st["install"] = {"target": lt["version"], "from": cur, "at": time.time()}
+        updater.save_state(sp, st)
+        oplog.log("update.install", ok=True, detail=f"{cur} -> {lt['version']}")
+        _job_set(job, status="done", progress=100, stage="安装已启动，应用即将重启")
+    except Exception as e:  # noqa: BLE001
+        _job_set(job, status="error", error=f"{type(e).__name__}: {e}")
+
+
+def update_install(body: dict) -> dict:
+    with _JOBS_LOCK:
+        for j in _JOBS.values():
+            if j.get("kind") == "update" and j["status"] == "running":
+                return {"ok": True, "job": j["id"]}
+        jid = f"{int(time.time() * 1000)}"
+        job = {"id": jid, "kind": "update", "name": "update", "status": "running", "progress": 1, "stage": "开始",
+               "log": [], "elapsed": 0, "downloaded": 0, "total": 0, "error": ""}
+        _JOBS[jid] = job
+    threading.Thread(target=_update_worker, args=(job, bool(body.get("reinstall"))), daemon=True).start()
+    return {"ok": True, "job": jid}
+
+
+def _update_scheduler() -> None:
+    """按用户设置的频率检查更新；有最短间隔和随机偏移，不会频繁访问 GitHub。"""
+    time.sleep(45 + updater.jitter(str(DATA_DIR)))
+    while True:
+        try:
+            s = update_settings()
+            st = updater.load_state(_update_state_path())
+            if updater.due(s, float(st.get("last_check") or 0)):
+                updater.save_state(_update_state_path(), updater.check(s, st, force=False))
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(60)
+
+
 # ----- 网页终端（PTY + WebSocket） -----
 
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -2562,6 +2687,10 @@ class Handler(BaseHTTPRequestHandler):
     def handle_api_get(self, path, qs):
         cfg = load_config()
 
+        if path == "/api/update/status":
+            self._json(200, update_status())
+            return
+
         if path == "/api/logs":
             try:
                 n = int((qs.get("limit") or ["200"])[0])
@@ -2702,6 +2831,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"ok": False, "error": "invalid name"})
                 return
             self._json(200, {"ok": True, "token": issue_term_token(name)})
+            return
+
+        if path == "/api/update/check":
+            self._json(200, update_check())
+            return
+
+        if path == "/api/update/settings":
+            self._json(200, update_save_settings(body))
+            return
+
+        if path == "/api/update/install":
+            self._json(200, update_install(body))
             return
 
         if path == "/api/job/cancel":
@@ -2870,6 +3011,7 @@ def main():
     oplog.log("server.start", ok=True, detail=f"data={DATA_DIR}")
 
     threading.Thread(target=boot_autostart, daemon=True).start()
+    threading.Thread(target=_update_scheduler, daemon=True).start()
     # 指定 --socket 时只走飞牛统一网关（由网关校验登录），不再开放任何 TCP 端口
     if args.socket:
         server = make_unix_server(args.socket)

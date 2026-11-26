@@ -208,6 +208,18 @@
     .pkg-chip.cur { border-color: var(--blue); color: var(--blue); }
     .pkg-chip.ok { border-color: var(--green); color: var(--green); }
     .pkg-chip.ok::before { content: "✓ "; }
+    .upd-banner { padding: 10px 14px; border-radius: 10px; border: 1px solid var(--border); margin: 6px 0; }
+    .upd-banner.ok { border-color: var(--green); background: rgba(48,209,88,.10); }
+    .upd-banner.new { border-color: var(--blue); background: rgba(89,194,255,.10); }
+    .upd-banner.err { border-color: var(--red); background: rgba(255,69,58,.10); }
+    .upd-banner .t { font-weight: 600; } .upd-banner .d { color: var(--muted); font-size: 13px; margin-top: 2px; white-space: pre-wrap; }
+    .upd-prog { margin: 8px 0; padding: 12px 14px; border: 1px solid var(--blue); border-radius: 10px; background: rgba(89,194,255,.08); }
+    .isl-notice { display: flex; align-items: center; gap: 12px; padding: 10px 14px 10px 16px; white-space: nowrap; }
+    .isl-notice svg { width: 18px; height: 18px; flex: none; fill: none; stroke: #30d158; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
+    .isl-notice .tt b { display: block; } .isl-notice .tt span { color: #8e8e93; font-size: 12px; }
+    .isl-btn { border: 0; border-radius: 999px; padding: 5px 14px; font-size: 13px; cursor: pointer; background: rgba(255,255,255,.14); color: #fff; }
+    .isl-btn:hover { background: rgba(255,255,255,.24); }
+    .isl-btn.pri { background: #0a84ff; } .isl-btn.pri:hover { background: #3d9bff; }
     .pkg-details { margin-top: 10px; }
     .pkg-details summary { cursor: pointer; color: var(--muted); font-size: 13px; user-select: none; }
     .pkg-details .log { margin-top: 8px; }
@@ -521,6 +533,53 @@
             <input id="set-timeout" type="number" min="5" max="120" style="min-width:100px" />
           </div>
           <button class="primary" id="btn-save-settings">保存</button>
+        </div>
+        <div class="card" style="margin-top:16px" id="upd-card">
+          <div class="row" style="margin-bottom:8px">
+            <strong>检查更新</strong>
+            <span class="sub" id="upd-cur" style="margin:0"></span>
+            <div class="spacer"></div>
+            <button id="upd-check">检查更新</button>
+          </div>
+          <div class="upd-banner hidden" id="upd-banner"></div>
+          <div class="upd-prog hidden" id="upd-prog">
+            <div class="row"><div class="spin"></div><div class="t" id="upd-stage" style="flex:1"></div><span class="sub" id="upd-pct" style="margin:0"></span><button id="upd-cancel">取消</button></div>
+            <div class="pkg-bar"><i id="upd-bar"></i></div>
+            <div class="d sub" id="upd-detail" style="margin:0"></div>
+          </div>
+          <details class="pkg-details hidden" id="upd-notes"><summary>更新内容</summary><pre class="log" id="upd-notes-text" style="max-height:200px;overflow:auto;font-size:12px"></pre></details>
+          <div class="row" style="margin-top:10px;gap:8px">
+            <button class="primary hidden" id="upd-go">立即更新</button>
+            <button class="hidden" id="upd-reinstall">重新安装当前版本</button>
+          </div>
+          <hr style="border:0;border-top:1px solid var(--border);margin:16px 0 12px">
+          <div class="field">
+            <label>自动检查</label>
+            <div class="row" style="gap:8px;flex-wrap:wrap">
+              <select id="upd-mode" style="min-width:150px">
+                <option value="off">关闭</option>
+                <option value="interval">每隔一段时间</option>
+                <option value="daily">每天固定时间</option>
+              </select>
+              <span id="upd-hours-wrap" class="row" style="gap:6px">每 <input id="upd-hours" type="number" min="1" max="720" style="width:80px" /> 小时</span>
+              <span id="upd-time-wrap" class="row hidden" style="gap:6px">每天 <input id="upd-time" type="time" style="width:120px" /></span>
+            </div>
+          </div>
+          <div class="field">
+            <label>下载加速源</label>
+            <div class="row" style="gap:8px;flex-wrap:wrap">
+              <select id="upd-proxy" style="min-width:230px">
+                <option value="auto">自动（直连失败时依次尝试 gh-proxy.com、ghfast.top）</option>
+                <option value="direct">仅直连 GitHub</option>
+                <option value="gh-proxy">gh-proxy.com</option>
+                <option value="ghfast">ghfast.top</option>
+                <option value="custom">自定义前缀…</option>
+              </select>
+              <input id="upd-custom" class="hidden" placeholder="https://你的加速域名/" style="min-width:260px;flex:1" />
+            </div>
+          </div>
+          <p class="hint" style="margin:0 0 10px">只读取本仓库的 Releases；自动检查最短间隔 1 小时，并带 ETag 缓存，不会频繁访问 GitHub API。发现新版本时，打开本页会在顶部灵动岛提示一次。升级使用飞牛的 appcenter-cli 安装 .fpk，期间应用会重启。</p>
+          <div class="row" style="gap:10px"><button class="primary" id="upd-save">保存检查设置</button><span class="sub" id="upd-last" style="margin:0"></span></div>
         </div>
         <div class="card" style="margin-top:16px">
           <div class="row" style="margin-bottom:8px">
@@ -1596,11 +1655,124 @@
         const name = tab.dataset.tab;
         $("#tab-list").classList.toggle("hidden", name !== "list");
         $("#tab-settings").classList.toggle("hidden", name !== "settings");
-        if (name === "settings") startOpsLogLive();
+        if (name === "settings") { startOpsLogLive(); updLoad(); }
         else stopOpsLogLive();
       };
     });
     
+    // ===== 检查更新 =====
+    let updSt = null, updBusy = false, updNotified = "";
+    const updFmt = (t) => (t ? new Date(t * 1000).toLocaleString() : "从未");
+    function updBanner(kind, title, desc) {
+      const el = $("#upd-banner");
+      el.className = `upd-banner ${kind}`;
+      el.innerHTML = `<div class="t">${esc(title)}</div>${desc ? `<div class="d">${esc(desc)}</div>` : ""}`;
+    }
+    function updRender(st) {
+      updSt = st;
+      $("#upd-cur").textContent = `当前版本 v${st.current}`;
+      const lt = st.latest;
+      $("#upd-go").classList.toggle("hidden", !st.available);
+      $("#upd-reinstall").classList.toggle("hidden", !(lt && !st.available));
+      $("#upd-go").textContent = lt ? `立即更新到 v${lt.version}` : "立即更新";
+      $("#upd-go").disabled = $("#upd-reinstall").disabled = !st.can_install;
+      $("#upd-notes").classList.toggle("hidden", !(lt && lt.notes));
+      if (lt) $("#upd-notes-text").textContent = lt.notes || "";
+      if (st.last_error) updBanner("err", "检查失败", st.last_error + (lt ? "\n（下面显示的是上次成功获取的结果）" : ""));
+      else if (st.available) updBanner("new", `发现新版本 v${lt.version}`, `当前 v${st.current}` + (lt.published_at ? ` · 发布于 ${lt.published_at.slice(0, 10)}` : "") + (st.can_install ? "" : "\n未找到 appcenter-cli，无法自动安装，请手动下载 .fpk 安装。"));
+      else if (lt) updBanner("ok", "已是最新版本", `最新发布：v${lt.version}`);
+      else updBanner("new", "还没有检查过", "点右上角「检查更新」，或等待自动检查。");
+      const s = st.settings;
+      $("#upd-mode").value = s.mode; $("#upd-hours").value = s.hours; $("#upd-time").value = s.time;
+      $("#upd-proxy").value = s.proxy; $("#upd-custom").value = s.custom_proxy || "";
+      updModeUi();
+      $("#upd-last").textContent = `上次检查：${updFmt(st.last_check)}`;
+    }
+    function updModeUi() {
+      const m = $("#upd-mode").value;
+      $("#upd-hours-wrap").classList.toggle("hidden", m !== "interval");
+      $("#upd-time-wrap").classList.toggle("hidden", m !== "daily");
+      $("#upd-custom").classList.toggle("hidden", $("#upd-proxy").value !== "custom");
+    }
+    $("#upd-mode").onchange = $("#upd-proxy").onchange = updModeUi;
+    async function updLoad() { const st = await api("/api/update/status"); if (st.ok) updRender(st); return st; }
+    $("#upd-check").onclick = async () => {
+      if (updBusy) return;
+      const b = $("#upd-check"); b.disabled = true; b.textContent = "检查中…";
+      const st = await api("/api/update/check", { method: "POST", body: {} });
+      b.disabled = false; b.textContent = "检查更新";
+      if (!st.ok) { toast(st.error || "检查失败"); return; }
+      updRender(st);
+      if (st.cooldown) toast("刚刚检查过，稍后再试");
+      else if (st.last_error) toast(st.last_error);
+      else toast(st.available ? `发现新版本 v${st.latest.version}` : "已是最新版本");
+    };
+    $("#upd-save").onclick = async () => {
+      const r = await api("/api/update/settings", { method: "POST", body: {
+        mode: $("#upd-mode").value, hours: Number($("#upd-hours").value), time: $("#upd-time").value,
+        proxy: $("#upd-proxy").value, custom_proxy: $("#upd-custom").value.trim() } });
+      if (!r.ok) { toast(r.error || "保存失败"); return; }
+      updRender(r); toast("检查设置已保存");
+    };
+    async function updInstall(reinstall) {
+      if (updBusy || !updSt) return;
+      const lt = updSt.latest;
+      if (!confirm(`将下载并安装 v${lt.version}${reinstall ? "（覆盖安装当前版本）" : ""}。\n安装期间应用会重启，页面会短暂不可用，已运行的容器不受影响。继续？`)) return;
+      updBusy = true;
+      $("#upd-go").disabled = $("#upd-reinstall").disabled = $("#upd-check").disabled = true;
+      $("#upd-prog").classList.remove("hidden");
+      $("#upd-cancel").disabled = false;
+      const done = () => { updBusy = false; $("#upd-go").disabled = $("#upd-reinstall").disabled = $("#upd-check").disabled = false; $("#upd-prog").classList.add("hidden"); };
+      const r = await api("/api/update/install", { method: "POST", body: { reinstall: !!reinstall } });
+      if (!r.ok) { done(); toast(r.error || "无法开始更新"); return; }
+      updJob = r.job;
+      for (;;) {
+        const j = await api(`/api/job/${r.job}`);
+        if (!j.ok) { done(); toast(j.error || "任务丢失"); return; }
+        $("#upd-stage").textContent = j.stage || "";
+        $("#upd-pct").textContent = `${j.progress}%`;
+        $("#upd-bar").style.width = `${j.progress}%`;
+        $("#upd-detail").textContent = j.total ? `${fmtMB(j.downloaded)} / ${fmtMB(j.total)}` : "";
+        if (j.status === "cancelled") { done(); toast("已取消更新"); return; }
+        if (j.status === "error") { done(); updBanner("err", "更新失败", j.error); toast(j.error || "更新失败"); return; }
+        if (j.status === "done") break;
+        await new Promise((res) => setTimeout(res, 800));
+      }
+      updJob = "";
+      $("#upd-cancel").disabled = true;
+      $("#upd-stage").textContent = "正在安装，应用即将重启，页面会自动刷新…";
+      await updWaitRestart(updSt.current);
+      done();
+    }
+    let updJob = "";
+    // 安装会重启服务：先等它下线、再等它回来；回来后刷新页面加载新版界面
+    async function updWaitRestart(oldVer) {
+      const t0 = Date.now(); let sawDown = false;
+      while (Date.now() - t0 < 240000) {
+        await new Promise((res) => setTimeout(res, 2000));
+        const st = await api("/api/update/status");
+        if (!st.ok || !st.current) { sawDown = true; continue; }
+        if (sawDown || st.current !== oldVer) { toast("更新完成，正在刷新页面"); setTimeout(() => location.reload(), 800); return; }
+      }
+      const st = await api("/api/update/status");
+      updBanner("err", "没有等到应用重启", (st.install && st.install.log ? "安装日志：\n" + st.install.log : "请稍后手动刷新页面，或在飞牛应用中心查看安装结果。"));
+    }
+    $("#upd-go").onclick = () => updInstall(false);
+    $("#upd-reinstall").onclick = () => updInstall(true);
+    $("#upd-cancel").onclick = async () => { if (updJob) { $("#upd-cancel").disabled = true; await api("/api/job/cancel", { method: "POST", body: { id: updJob } }); } };
+    // 有新版本：打开面板时在灵动岛提示一次（同一版本本次打开不重复）
+    async function updNotifyIfNew() {
+      const st = await api("/api/update/status");
+      if (!st.ok || !st.available || updNotified === st.latest.version) return;
+      updNotified = st.latest.version;
+      islNotice(`发现新版本 v${st.latest.version}`, `当前 v${st.current}`, [
+        { label: "查看", primary: true, fn: () => { const t = document.querySelector('.tab[data-tab="settings"]'); if (t) t.click(); updLoad().then(() => $("#upd-card").scrollIntoView({ behavior: "smooth", block: "start" })); } },
+        { label: "忽略" },
+      ]);
+    }
+    setTimeout(updNotifyIfNew, 2500);
+    setInterval(updNotifyIfNew, 30 * 60 * 1000);
+
     let _opsLogTimer = null;
     let _opsLogText = "";
     async function loadOpsLog(silent) {
@@ -1809,7 +1981,7 @@
       }
     }
     // ----- 灵动岛 -----
-    const isl = { el: cv("island"), inn: cv("isl-in"), last: "", hover: false, toast: null, toastT: 0, leaveT: 0, swapT: 0 };
+    const isl = { el: cv("island"), inn: cv("isl-in"), last: "", hover: false, toast: null, toastT: 0, leaveT: 0, swapT: 0, notice: null, noticeT: 0 };
     const ISL_ERR = /失败|错误|无效|不能|不存在|无法|拒绝|超时|不支持|不允许|不足|冲突/;
     const ISL_ICON = {
       ok: '<svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>',
@@ -1821,6 +1993,14 @@
       isl.toastT = setTimeout(() => { isl.toast = null; islRender(); }, Math.max(2200, Math.min(5000, String(msg).length * 120)));
       islRender();
     }
+    // 带按钮的通知（如“发现新版本”）：显示一会儿后自动收起，只弹一次
+    function islNotice(title, sub, actions, ttl = 14000) {
+      clearTimeout(isl.noticeT);
+      isl.notice = { title, sub, actions };
+      isl.noticeT = setTimeout(() => { isl.notice = null; islRender(); }, ttl);
+      islRender();
+    }
+    function islNoticeClose() { clearTimeout(isl.noticeT); isl.notice = null; islRender(); }
     function islSessions() {  // 正在忙（黄点）的排最前，已断开的排最后，其余保持打开顺序
       const rank = (s) => (s.dead ? 2 : s.busy ? 0 : 1);
       return termSessions.map((s, i) => [s, i]).sort((a, b) => rank(a[0]) - rank(b[0]) || a[1] - b[1]).map((v) => v[0]);
@@ -1828,6 +2008,11 @@
     const dotCls = (s) => (s.dead ? "off" : s.busy ? "new" : "");
     function islHtml() {
       if (isl.toast) return `<div class="isl-toast ${isl.toast.cls}">${ISL_ICON[isl.toast.cls]}<span>${esc(isl.toast.msg)}</span></div>`;
+      if (isl.notice) {
+        const n = isl.notice;
+        return `<div class="isl-notice"><svg viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg><div class="tt"><b>${esc(n.title)}</b>${n.sub ? `<span>${esc(n.sub)}</span>` : ""}</div>` +
+          n.actions.map((a, i) => `<button class="isl-btn ${a.primary ? "pri" : ""}" data-act="${i}">${esc(a.label)}</button>`).join("") + `</div>`;
+      }
       const ss = islSessions();
       if (!ss.length) return "";
       if (isl.hover) {
@@ -1855,14 +2040,16 @@
       else { swap(); isl.el.classList.add("show"); }
     }
     const termRenderDock = islRender;
-    isl.el.addEventListener("mouseenter", () => { clearTimeout(isl.leaveT); if (!isl.hover) { isl.hover = true; islRender(); } });
+    isl.el.addEventListener("mouseenter", () => { clearTimeout(isl.leaveT); if (!isl.hover && !isl.notice) { isl.hover = true; islRender(); } });
     isl.el.addEventListener("mouseleave", () => { clearTimeout(isl.leaveT); isl.leaveT = setTimeout(() => { isl.hover = false; islRender(); }, 220); });
     isl.el.addEventListener("click", (e) => {
+      const act = e.target.closest("[data-act]");
+      if (act && isl.notice) { const a = isl.notice.actions[Number(act.dataset.act)]; islNoticeClose(); if (a && a.fn) a.fn(); return; }
       const x = e.target.closest("[data-x]");
       if (x) { e.stopPropagation(); const s = termSessions.find((v) => v.id === Number(x.dataset.x)); if (s) termDestroy(s); return; }
       const r = e.target.closest(".isl-row");
       if (r) { const s = termSessions.find((v) => v.id === Number(r.dataset.id)); if (s) { isl.hover = false; termActivate(s); } return; }
-      if (!isl.toast) { isl.hover = !isl.hover; islRender(); }  // 触屏：点一下展开/收起
+      if (!isl.toast && !isl.notice) { isl.hover = !isl.hover; islRender(); }  // 触屏：点一下展开/收起
     });
     function termActivate(s) {
       termActive = s;
