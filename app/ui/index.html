@@ -236,6 +236,15 @@
       border-radius: 12px; padding: 22px; width: min(480px, 92vw);
     }
     .modal h2 { margin: 0 0 14px; font-size: 16px; }
+    .dlg-bg { z-index: 120; }
+    .dlg { width: min(420px, 92vw); padding: 20px 22px 18px; }
+    .dlg h2 { margin: 0 0 8px; }
+    .dlg .dlg-msg { color: var(--muted); font-size: 14px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; margin: 0 0 14px; }
+    .dlg input.dlg-in { width: 100%; box-sizing: border-box; margin: 0 0 14px; }
+    .dlg .dlg-btns { display: flex; justify-content: flex-end; gap: 8px; }
+    .dlg-bg { animation: dlgfade .12s ease-out; } .dlg { animation: dlgpop .14s ease-out; }
+    @keyframes dlgfade { from { opacity: 0; } to { opacity: 1; } }
+    @keyframes dlgpop { from { transform: translateY(6px) scale(.98); opacity: 0; } to { transform: none; opacity: 1; } }
     .snap-table { width: 100%; border-collapse: collapse; font-size: 13px; margin: 6px 0 12px; }
     .snap-table th { text-align: left; color: var(--muted); font-weight: 500; padding: 6px 8px; border-bottom: 1px solid var(--border); }
     .snap-table td { padding: 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
@@ -539,7 +548,7 @@
           <div class="row" style="margin-bottom:8px">
             <strong>宿主终端</strong>
             <div class="spacer"></div>
-            <label style="display:flex;gap:8px;align-items:center;cursor:pointer"><input type="checkbox" id="host-enable" /> 启用</label>
+            <label class="switch" title="启用宿主终端"><input type="checkbox" id="host-enable"><span></span></label>
           </div>
           <p class="hint" style="margin:0 0 10px">在页面里打开飞牛宿主机的 <b>root</b> shell（与容器终端并列，可最小化到灵动岛，带颜色）。只有飞牛管理员能访问本应用；每次启用、打开、关闭都会写入操作日志。未启用时页头不显示「宿主终端」入口，关闭开关会立即结束所有宿主终端。</p>
           <div class="row" style="gap:8px;flex-wrap:wrap">
@@ -1222,25 +1231,65 @@
     $("#snap-close").onclick = () => $("#modal-snap").classList.add("hidden");
     $("#snap-create").onclick = () =>
       snapRun({ op: "create", comment: $("#snap-comment").value, freeze: $("#snap-freeze").checked }, "正在创建快照").then(() => { $("#snap-comment").value = ""; });
-    $("#snap-rows").addEventListener("click", (e) => {
+    $("#snap-rows").addEventListener("click", async (e) => {
       const b = e.target.closest("button[data-s]");
       if (!b || snapBusy) return;
       const snap = b.dataset.n, act = b.dataset.s;
       if (act === "delete") {
-        if (confirm(`确认删除快照 ${snap}？`)) snapRun({ op: "delete", snap, confirm: true }, "正在删除快照");
+        if (await uiConfirm(`确认删除快照 ${snap}？`, { title: "删除快照", okText: "删除", danger: true })) snapRun({ op: "delete", snap, confirm: true }, "正在删除快照");
       } else if (act === "restore") {
-        if (confirm(`确认把 ${snapCt} 回滚到 ${snap}？当前状态会被覆盖，此操作不可恢复。`))
+        if (await uiConfirm(`确认把 ${snapCt} 回滚到 ${snap}？当前状态会被覆盖，此操作不可恢复。`, { title: "回滚快照", okText: "回滚", danger: true }))
           snapRun({ op: "restore", snap, confirm: true }, "正在回滚");
       } else {
-        const nn = prompt(`把 ${snap} 克隆为新容器，请输入新容器名称：`, `${snapCt}-copy`);
+        const nn = await uiPrompt(`把 ${snap} 克隆为新容器，请输入新容器名称：`, `${snapCt}-copy`, { title: "克隆为新容器", okText: "克隆" });
         if (nn) snapRun({ op: "restore", snap, as_new: nn.trim(), confirm: true }, "正在克隆");
       }
     });
 
+    // ===== 应用内对话框：替代浏览器自带的 confirm / prompt / alert =====
+    function uiDialog({ title = "", message = "", input = null, okText = "确定", cancelText = "取消", danger = false, noCancel = false }) {
+      return new Promise((resolve) => {
+        const bg = document.createElement("div");
+        bg.className = "modal-bg dlg-bg";
+        bg.innerHTML = `<div class="modal dlg" role="dialog" aria-modal="true">
+          ${title ? `<h2>${esc(title)}</h2>` : ""}
+          <div class="dlg-msg">${esc(message)}</div>
+          ${input !== null ? `<input class="dlg-in" type="text" value="${esc(String(input))}" />` : ""}
+          <div class="dlg-btns">${noCancel ? "" : `<button type="button" data-r="0">${esc(cancelText)}</button>`}<button type="button" data-r="1" class="${danger ? "danger" : "primary"}">${esc(okText)}</button></div></div>`;
+        const prevFocus = document.activeElement;
+        const inEl = bg.querySelector(".dlg-in"), okBtn = bg.querySelector('[data-r="1"]');
+        const done = (ok) => {
+          document.removeEventListener("keydown", onKey, true);
+          bg.remove();
+          if (prevFocus && prevFocus.focus) { try { prevFocus.focus(); } catch (e) {} }
+          resolve(input !== null ? (ok ? inEl.value : null) : ok);
+        };
+        const onKey = (e) => {
+          if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); done(false); }
+          else if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); e.stopPropagation(); done(true); }
+          else if (e.key === "Tab") {      // 焦点留在对话框内
+            const f = [...bg.querySelectorAll("input,button")];
+            const i = f.indexOf(document.activeElement);
+            e.preventDefault();
+            f[(i + (e.shiftKey ? f.length - 1 : 1)) % f.length].focus();
+          }
+        };
+        document.addEventListener("keydown", onKey, true);
+        bg.addEventListener("mousedown", (e) => { if (e.target === bg && !noCancel) done(false); });
+        bg.addEventListener("click", (e) => { const b = e.target.closest("button[data-r]"); if (b) done(b.dataset.r === "1"); });
+        document.body.appendChild(bg);
+        (inEl || okBtn).focus();
+        if (inEl) inEl.select();
+      });
+    }
+    const uiConfirm = (message, o = {}) => uiDialog({ title: "请确认", ...o, message });
+    const uiPrompt = (message, value = "", o = {}) => uiDialog({ title: "请输入", ...o, message, input: value });
+    const uiAlert = (message, o = {}) => uiDialog({ title: "提示", ...o, message, noCancel: true });
+
     async function resizeCt(name, cur) {
       const st = await api("/api/storage");
       const free = st.ok ? Math.floor(st.free / 1073741824) : "?";
-      const v = prompt(`${name} 当前 ${cur} GB。输入新的镜像大小（GB，只能扩大）。\n磁盘剩余约 ${free} GB；稀疏镜像不会立刻占满，但写满宿主盘会损坏镜像，请留出余量。`, String(Math.ceil(Number(cur) * 2) || 20));
+      const v = await uiPrompt(`${name} 当前 ${cur} GB。输入新的镜像大小（GB，只能扩大）。\n磁盘剩余约 ${free} GB；稀疏镜像不会立刻占满，但写满宿主盘会损坏镜像，请留出余量。`, String(Math.ceil(Number(cur) * 2) || 20), { title: "扩大镜像", okText: "扩容" });
       if (!v) return;
       toast("扩容中…");
       const r = await api(`/api/container/${encodeURIComponent(name)}/resize`, { method: "POST", body: { size_gb: Number(v) } });
@@ -1257,7 +1306,7 @@
     }
 
     async function exportCt(name) {
-      if (!confirm(`把 ${name} 的 rootfs 打包为 .tar.gz？\n文件保存在容器存储目录下的 exports/，可用于「自定义 rootfs」重新创建。`)) return;
+      if (!(await uiConfirm(`把 ${name} 的 rootfs 打包为 .tar.gz？\n文件保存在容器存储目录下的 exports/，可用于「自定义 rootfs」重新创建。`, { title: "导出 rootfs", okText: "导出" }))) return;
       toast("开始导出…");
       const r = await api(`/api/container/${encodeURIComponent(name)}/export`, { method: "POST", body: {} });
       if (!r.ok) { toast(r.error || "失败"); return; }
@@ -1266,14 +1315,14 @@
         const j = await api(`/api/job/${r.job}`);
         if (!j.ok) { toast(j.error || "任务丢失"); return; }
         if (j.status === "running") continue;
-        if (j.status === "done") alert(`导出完成：\n${(j.log || [])[0] || r.dest}`);
+        if (j.status === "done") await uiAlert(`导出完成：\n${(j.log || [])[0] || r.dest}`, { title: "导出完成" });
         else toast(j.error || "导出失败");
         return;
       }
     }
 
     async function onAction(name, action, btn) {
-      if (action === "destroy" && !confirm(`确认删除容器 ${name}？其所有快照也会一并删除，此操作不可恢复。`)) return;
+      if (action === "destroy" && !(await uiConfirm(`确认删除容器 ${name}？其所有快照也会一并删除，此操作不可恢复。`, { title: "删除容器", okText: "删除", danger: true }))) return;
       if (btn) btn.disabled = true;
       toast(`${action} ${name}…`);
       const body = { name, action };
@@ -1305,8 +1354,8 @@
       toast(currentConfig.host_terminal ? "宿主终端已启用" : "宿主终端已关闭");
     };
     const HOST_TERM = "_host";
-    $("#btn-host").onclick = () => {
-      if (!confirm("将打开飞牛宿主机的 root 终端，拥有整机最高权限，请谨慎操作。继续？")) return;
+    $("#btn-host").onclick = async () => {
+      if (!(await uiConfirm("将打开飞牛宿主机的 root 终端，拥有整机最高权限，请谨慎操作。", { title: "打开宿主终端", okText: "打开", danger: true }))) return;
       openTerm(HOST_TERM);
     };
 
@@ -1642,7 +1691,7 @@
       const a = e.target.closest("a[data-cache]");
       if (!a) return;
       e.preventDefault();
-      if (!confirm(a.dataset.cache ? "删除该缓存文件？" : "清空全部下载缓存？（已创建的容器不受影响）")) return;
+      if (!(await uiConfirm(a.dataset.cache ? "删除该缓存文件？" : "清空全部下载缓存？（已创建的容器不受影响）", { title: a.dataset.cache ? "删除缓存" : "清空缓存", okText: a.dataset.cache ? "删除" : "清空", danger: true }))) return;
       await api("/api/custom-cache/clear", { method: "POST", body: a.dataset.cache ? { file: a.dataset.cache } : {} });
       loadCache();
     });
@@ -1754,7 +1803,7 @@
     async function updInstall(reinstall) {
       if (updBusy || !updSt) return;
       const lt = updSt.latest;
-      if (!confirm(`将下载并安装 v${lt.version}${reinstall ? "（覆盖安装当前版本）" : ""}。\n更新会先停止并卸载本应用再重装（设置与容器数据保留，已运行的容器不受影响），页面会暂时不可用，完成后自动刷新。继续？`)) return;
+      if (!(await uiConfirm(`将下载并安装 v${lt.version}${reinstall ? "（覆盖安装当前版本）" : ""}。\n更新会先停止并卸载本应用再重装（设置与容器数据保留，已运行的容器不受影响），页面会暂时不可用，完成后自动刷新。`, { title: "更新应用", okText: "更新" }))) return;
       updBusy = true;
       $("#upd-go").disabled = $("#upd-reinstall").disabled = $("#upd-check").disabled = true;
       $("#upd-prog").classList.remove("hidden");
@@ -1853,7 +1902,7 @@
     }
     $("#btn-log-refresh") && ($("#btn-log-refresh").onclick = () => loadOpsLog());
     $("#btn-log-clear") && ($("#btn-log-clear").onclick = async () => {
-      if (!confirm("确认清空操作日志？")) return;
+      if (!(await uiConfirm("确认清空操作日志？", { title: "清空日志", okText: "清空", danger: true }))) return;
       await api("/api/logs/clear", { method: "POST", body: {} });
       _opsLogText = "";
       loadOpsLog();
@@ -2000,7 +2049,7 @@
     cv("cfg-save-restart").onclick = () => saveConfig(true);
     cv("cfg-cancel").onclick = () => cv("modal-cfg").classList.add("hidden");
     cv("c-raw-save").onclick = async () => {
-      if (!confirm("直接覆盖容器配置文件？（旧配置会备份为 config.fnos-bak）")) return;
+      if (!(await uiConfirm("直接覆盖容器配置文件？（旧配置会备份为 config.fnos-bak）", { title: "覆盖配置文件", okText: "覆盖", danger: true }))) return;
       const r = await api(`/api/container/${encodeURIComponent(cfgName)}/config`, { method: "POST", body: { config: cv("c-raw").value } });
       toast(r.ok ? (r.needs_restart ? "已保存，重启容器后生效" : "已保存") : (r.error || "保存失败"));
       if (r.ok) openConfig(cfgName);
