@@ -1,0 +1,27 @@
+# fnos-lxc 宿主终端专用 bash 配置：只对宿主终端这个 shell 生效，不读也不改 ~/.bashrc 和系统文件。
+# 先加载系统登录环境（PATH、语言环境、飞牛自己追加的路径），再补颜色、别名和提示符。
+[ -r /etc/profile ] && . /etc/profile >/dev/null 2>&1
+
+export TERM="${TERM:-xterm-256color}" COLORTERM=truecolor
+umask 022
+cd "$HOME" 2>/dev/null || cd /
+
+# 颜色：ls / grep / diff / ip
+if command -v dircolors >/dev/null 2>&1; then eval "$(dircolors -b 2>/dev/null)"; fi
+export LS_OPTIONS='--color=auto'
+alias ls='ls $LS_OPTIONS'
+alias ll='ls $LS_OPTIONS -lh'
+alias l='ls $LS_OPTIONS -lAh'
+alias grep='grep --color=auto'
+alias egrep='egrep --color=auto'
+alias fgrep='fgrep --color=auto'
+alias diff='diff --color=auto'
+alias ip='ip -color=auto'
+
+# 提示符：用户@主机（绿）:路径（蓝）# ；退出码非 0 时在前面显示红色数字
+_fnlxc_rc() { local r=$?; [ $r -ne 0 ] && printf '\001\033[1;31m\002%s \001\033[0m\002' "$r"; }
+if [ "$(id -u)" = 0 ]; then _p='#'; else _p='$'; fi
+PS1='$(_fnlxc_rc)\[\033[1;32m\]\u@\h\[\033[0m\]:\[\033[1;34m\]\w\[\033[0m\]'"$_p"' '
+unset _p
+HISTSIZE=5000
+HISTCONTROL=ignoredups

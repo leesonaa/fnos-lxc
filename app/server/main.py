@@ -45,6 +45,8 @@ SYS_NET = Path(os.environ.get("FNLXC_SYS_NET", "/sys/class/net"))
 _CONF_LOCK = threading.Lock()
 GATEWAY_PREFIX = "/app/fnos-lxc"
 CSRF_HEADER = ("X-Requested-With", "fnos-lxc")
+HOST_TERM = "_host"                      # 宿主终端的保留名；容器名必须以字母数字开头，不会与之冲突
+HOST_IDLE_CHOICES = (1800, 3600, 43200)
 _TERM_TOKENS: dict = {}
 _TERM_LOCK = threading.Lock()
 
@@ -74,6 +76,8 @@ DEFAULT_CONFIG = {
     "autostart_delay": 5,
     "service_enabled": True,
     "image_mirror": "official",
+    "host_terminal": False,      # 宿主终端（root shell），默认关闭
+    "host_term_idle": 3600,      # 宿主终端：页面断开后会话保留多少秒
 }
 
 
@@ -458,6 +462,21 @@ def lxc_base() -> Path:
 def clean_name(name: str) -> str:
     name = (name or "").strip()
     return name if _NAME_RE.match(name) else ""
+
+
+def term_name(name: str) -> str:
+    """终端目标：容器名，或宿主终端保留名。"""
+    name = (name or "").strip()
+    return HOST_TERM if name == HOST_TERM else clean_name(name)
+
+
+def host_term_enabled() -> bool:
+    return bool(load_config().get("host_terminal"))
+
+
+def host_term_idle() -> int:
+    v = load_config().get("host_term_idle")
+    return v if v in HOST_IDLE_CHOICES else 3600
 
 
 def ct_config_path(name: str) -> Path | None:
@@ -2223,6 +2242,16 @@ def _terminal_argv(name: str) -> list:
     return argv + ["--", "/bin/sh", "-c", _SHELL]
 
 
+def _host_term_argv() -> list:
+    """宿主机 root shell：干净环境 + 自带 rc（先加载 /etc/profile，再补颜色/别名/提示符），不读 ~/.bashrc。"""
+    rc = Path(__file__).resolve().parent / "hostterm.rc"
+    env = [*_ENV, "COLORTERM=truecolor", "USER=root", "LOGNAME=root", "SHELL=/bin/bash"]
+    sh = shutil.which("bash")
+    if sh and rc.is_file():
+        return ["/usr/bin/env", "-i", *env, sh, "--noprofile", "--rcfile", str(rc), "-i"]
+    return ["/usr/bin/env", "-i", *env, shutil.which("sh") or "/bin/sh", "-i"]
+
+
 _TERM_SLOTS = threading.BoundedSemaphore(8)  # 同时最多 8 个终端会话
 TERM_BUF_MAX = 256 * 1024          # 断线期间保留的输出，重连时回放
 TERM_DETACH_TTL = 12 * 3600        # 没有任何页面连着时，会话最多保留 12 小时
@@ -2252,6 +2281,7 @@ class TermSession:
     def __init__(self, name: str, argv: list, cols: int, rows: int, slot: bool = True):
         self.sid = secrets.token_urlsafe(16)
         self.name, self.slot = name, slot
+        self.ttl = host_term_idle() if name == HOST_TERM else TERM_DETACH_TTL
         self.lock = threading.Lock()
         self.buf = bytearray()
         self.client: _WsClient | None = None
@@ -2296,7 +2326,7 @@ class TermSession:
                 if self.proc.poll() is not None:
                     break
                 now = time.monotonic()
-                if self.detached_at is not None and now - self.detached_at > TERM_DETACH_TTL:
+                if self.detached_at is not None and now - self.detached_at > self.ttl:
                     break
                 if self.client is not None and now - last_ping > 30:
                     last_ping = now
@@ -2362,6 +2392,8 @@ class TermSession:
             self._done = True
             self.alive = False
             c, self.client = self.client, None
+        if self.name == HOST_TERM:
+            oplog.log("terminal.host.close", ok=True, name=HOST_TERM)
         with _TERMS_LOCK:
             _TERMS.pop(self.sid, None)
         for sig in (signal.SIGHUP, signal.SIGKILL):
@@ -2414,10 +2446,13 @@ def terminal_session(handler, name: str, cols: int, rows: int, sid: str = "", sl
         sess.resize(rows, cols)
     else:
         try:
-            sess = TermSession(name, _terminal_argv(name), cols, rows, slot=slot)
+            argv = _host_term_argv() if name == HOST_TERM else _terminal_argv(name)
+            sess = TermSession(name, argv, cols, rows, slot=slot)
         except OSError:
             raise                      # 名额由 handle_term 释放
         handler._slot_owned = True
+        if name == HOST_TERM:
+            oplog.log("terminal.host.open", ok=True, name=HOST_TERM)
         if not sess.attach(client):
             sess.finish()
             return
@@ -2641,7 +2676,7 @@ class Handler(BaseHTTPRequestHandler):
         self.handle_api_post(path, body)
 
     def handle_term(self, name, qs):
-        name = clean_name(name)
+        name = term_name(name)
         key = self.headers.get("Sec-WebSocket-Key")
         if not name or not key or "websocket" not in (self.headers.get("Upgrade") or "").lower():
             self._json(400, {"ok": False, "error": "websocket required"})
@@ -2649,7 +2684,11 @@ class Handler(BaseHTTPRequestHandler):
         if not consume_term_token((qs.get("token") or [""])[0], name):
             self._json(403, {"ok": False, "error": "invalid or expired token"})
             return
-        if container_state(name) != "RUNNING":
+        if name == HOST_TERM:
+            if not host_term_enabled():
+                self._json(403, {"ok": False, "error": "宿主终端未启用"})
+                return
+        elif container_state(name) != "RUNNING":
             self._json(409, {"ok": False, "error": "容器未运行"})
             return
         sid = (qs.get("sid") or [""])[0]
@@ -2709,6 +2748,8 @@ class Handler(BaseHTTPRequestHandler):
                         "lxcpath": cfg.get("lxcpath"),
                         "bridge": cfg.get("bridge"),
                         "timeout": cfg.get("timeout"),
+                        "host_terminal": bool(cfg.get("host_terminal")),
+                        "host_term_idle": cfg.get("host_term_idle") if cfg.get("host_term_idle") in HOST_IDLE_CHOICES else 3600,
                     },
                 },
             )
@@ -2826,9 +2867,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/container/term-token":
-            name = clean_name(body.get("name", ""))
+            name = term_name(body.get("name", ""))
             if not name:
                 self._json(400, {"ok": False, "error": "invalid name"})
+                return
+            if name == HOST_TERM and not host_term_enabled():
+                self._json(403, {"ok": False, "error": "宿主终端未启用，请先在设置里开启"})
                 return
             self._json(200, {"ok": True, "token": issue_term_token(name)})
             return
@@ -2850,7 +2894,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/container/term-close":
-            ok = close_term_session(str(body.get("sid", "")), clean_name(body.get("name", "")))
+            ok = close_term_session(str(body.get("sid", "")), term_name(body.get("name", "")))
             self._json(200, {"ok": True, "closed": ok})
             return
 
@@ -2902,6 +2946,25 @@ class Handler(BaseHTTPRequestHandler):
                     cfg[k] = _clamp_int(body[k], cfg.get(k, 15), lo, hi)
             if "service_enabled" in body:
                 cfg["service_enabled"] = bool(body["service_enabled"])
+            if "host_term_idle" in body:
+                try:
+                    v = int(body["host_term_idle"])
+                except (TypeError, ValueError):
+                    v = 0
+                if v not in HOST_IDLE_CHOICES:
+                    self._json(200, {"ok": False, "error": "宿主终端保留时间无效"})
+                    return
+                cfg["host_term_idle"] = v
+            if "host_terminal" in body:
+                en = bool(body["host_terminal"])
+                if en != bool(cfg.get("host_terminal")):
+                    oplog.log("terminal.host.enable" if en else "terminal.host.disable", ok=True)
+                cfg["host_terminal"] = en
+                if not en:   # 关闭开关：立即结束所有宿主终端会话
+                    with _TERMS_LOCK:
+                        live = [t for t in _TERMS.values() if t.name == HOST_TERM]
+                    for t in live:   # finish() 要等进程退出，放到后台，别拖慢保存请求
+                        threading.Thread(target=t.finish, daemon=True).start()
             warning = ""
             if "lxcpath" in body:
                 cfg["lxcpath"] = body["lxcpath"]

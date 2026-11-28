@@ -4,6 +4,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 _TMP = tempfile.mkdtemp()
@@ -229,6 +230,51 @@ class AptParseTests(unittest.TestCase):
         self.assertEqual(p("random text")["kind"], "log")
         self.assertEqual(p("pmstatus:x:abc:y")["kind"], "log")      # 坏数据不抛异常
         self.assertEqual(p("pmstatus:x:150:y")["pct"], 100.0)        # 夹紧到 0-100
+
+
+class HostTermTests(unittest.TestCase):
+    def test_names(self):
+        self.assertEqual(main.term_name("_host"), "_host")
+        self.assertEqual(main.term_name(" _host "), "_host")
+        self.assertEqual(main.term_name("test1"), "test1")
+        self.assertEqual(main.term_name("../x"), "")
+        self.assertEqual(main.term_name("_host/x"), "")
+        self.assertEqual(main.clean_name("_host"), "")     # 容器名不可能与保留名冲突
+
+    def test_enabled_and_idle_follow_config(self):
+        with mock.patch.object(main, "load_config", return_value={"host_terminal": False}):
+            self.assertFalse(main.host_term_enabled())
+        with mock.patch.object(main, "load_config", return_value={"host_terminal": True, "host_term_idle": 1800}):
+            self.assertTrue(main.host_term_enabled())
+            self.assertEqual(main.host_term_idle(), 1800)
+        with mock.patch.object(main, "load_config", return_value={"host_term_idle": 5}):
+            self.assertEqual(main.host_term_idle(), 3600)   # 非法值回落到默认
+
+    def test_argv_uses_own_rc_and_clean_env(self):
+        argv = main._host_term_argv()
+        self.assertEqual(argv[:3], ["/usr/bin/env", "-i", main._ENV[0]])
+        self.assertIn("--noprofile", argv)
+        self.assertTrue(argv[argv.index("--rcfile") + 1].endswith("hostterm.rc"))
+        self.assertIn("COLORTERM=truecolor", argv)
+
+    def test_real_shell_has_colors_and_home(self):
+        import time
+        c = TermSessionTests.FakeClient()
+        with mock.patch.object(main, "load_config", return_value={"host_terminal": True, "host_term_idle": 1800}):
+            sess = main.TermSession(main.HOST_TERM, main._host_term_argv(), 100, 30, slot=False)
+        self.assertEqual(sess.ttl, 1800)
+        try:
+            sess.attach(c)
+            w = TermSessionTests.wait
+            self.assertTrue(w(self, lambda: b"\x1b[1;32m" in c.data(), 8))      # 绿色提示符
+            sess.write(b"echo HOME=$HOME; ls --color=always /etc | head -3; alias ls; echo done\n")
+            self.assertTrue(w(self, lambda: b"\r\ndone\r\n" in c.data(), 8))
+            d = c.data()
+            self.assertIn(b"HOME=/root", d)
+            self.assertIn(b"\x1b[", d.split(b"HOME=/root", 1)[1])               # ls 输出带颜色转义
+            self.assertIn(b"alias ls=", d)
+        finally:
+            sess.finish()
 
 
 class TermSessionTests(unittest.TestCase):
